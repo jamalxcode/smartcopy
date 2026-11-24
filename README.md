@@ -39,13 +39,20 @@ Ways to make it fit your day:
 
 ## Requirements
 
-- macOS, run with `sudo`.
-- rsync 3.2 or newer: `brew install rsync`. The rsync that comes with macOS is too old.
-- Terminal with **Full Disk Access** (System Settings → Privacy & Security → Full Disk Access). Without it, protected files can't be read.
+| Dependency | Install |
+|---|---|
+| macOS (Apple silicon or Intel), run with `sudo` | — |
+| [Homebrew](https://brew.sh) | see brew.sh |
+| **rsync 3.2+** (Homebrew's build includes xxhash for fast checksums) | `brew install rsync`, or `brew bundle` using the included `Brewfile` |
+| Terminal with **Full Disk Access** | System Settings → Privacy & Security → Full Disk Access → Terminal |
+| git (only to clone) | `xcode-select --install` |
+
+The rsync that comes with macOS is too old. Everything else smartcopy uses is built into macOS. The full list, plus a readiness check, is in [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md).
 
 ## Install
 
 ```bash
+brew install rsync            # or: brew bundle
 git clone https://github.com/jamalxcode/smartcopy.git
 cd smartcopy
 chmod +x smartcopy.sh
@@ -139,6 +146,7 @@ See [PRIVACY.md](PRIVACY.md). In short:
 ## Documentation
 
 - [`man/smartcopy.1`](man/smartcopy.1): full manual with examples
+- [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md): what to install, and the macOS tools it uses
 - [`docs/DESIGN.md`](docs/DESIGN.md): how it works and why
 - [`docs/CONVERSATION.md`](docs/CONVERSATION.md): how the tool was designed, one request at a time
 - [`CHANGELOG.md`](CHANGELOG.md): version history
