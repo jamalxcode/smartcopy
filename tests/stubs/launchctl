@@ -1,0 +1,5 @@
+#!/bin/bash
+# Test stand-in for "launchctl asuser UID sudo -u USER osascript/open ...": records notifications.
+shift 2; [ "$1" = sudo ] && shift 3
+if [ "$1" = osascript ] && [ -n "${SC_TEST_NOTIFY:-}" ]; then printf '%s\n' "$3" >> "$SC_TEST_NOTIFY"; fi
+exit 0

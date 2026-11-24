@@ -31,8 +31,11 @@ When the destination isn't an external drive, `rsync-logs` goes inside the desti
 **Nothing is written to the Mac's own drive** (no home-folder logs, no `/tmp` files) **and nothing to the source drive.** Some care went into this:
 
 - The log folder is created only after the destination drive is confirmed mounted. If the drive is missing, nothing gets created in its place on the internal disk. That's a classic `/Volumes` pitfall.
-- If the drive disconnects mid-run, writes to the log folder simply fail until it returns. They never fall through to the internal disk.
+- If the drive disconnects mid-run, writes to the log folder simply fail until it returns. They never fall through to the internal disk. Every rsync that writes runs with the destination folder as its working directory, after checking that this folder really is on the destination drive. If the drive is unplugged, its writes fail instead of landing in an empty `/Volumes/Name` folder on the internal disk. The destination folder and the log folder are created from inside the drive in the same way.
+- Temporary files from any tool (`sort`, the shell) go in the run's own folder inside `rsync-logs`: `TMPDIR` points there. The script avoids shell here-documents, which macOS's bash 3.2 writes to temporary files and could put in `/tmp` if `TMPDIR` were unavailable. If the destination drive is missing when a run ends, the report is shown on screen and not saved anywhere.
+- No network connections are made, and nothing is sent anywhere. There is no telemetry.
 - This was tested by running every mode, including copy, check, dry run, background with stop and resume, and runs with errors, then searching the whole system for new files. The source drive's contents and timestamps were unchanged.
+- These rules are checked by automated tests (`sudo tests/run.sh`, on Linux with loop-mounted drives). They scan the whole system disk, `TMPDIR` and `HOME` for anything new after a run. They compare the source's names, sizes, dates, permissions and change times before and after. They trace every network socket. They search the screen output, notifications and reports for a marker word that appears only in test file names. And they unplug the destination mid-copy to check that nothing appears in its place and the copy finishes when it returns.
 
 Two system things are outside the tool's control: `sudo` records that the command ran in the system log, and the shell may save the command in its history.
 

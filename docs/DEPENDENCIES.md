@@ -53,8 +53,8 @@ smartcopy also uses standard macOS tools that are always present:
 | `osascript`, `launchctl`, `open` | Notifications; opening the report in TextEdit (background mode) |
 | `chflags`, `chmod`, `chown` | Hiding and protecting the `rsync-logs` folder |
 | `shasum` | Naming locks |
-| `nohup`, `ps`, `pkill`, `kill` | Background mode, `--stop`, locks |
-| `awk`, `sed`, `grep`, `sort`, `find`, `du`, `xargs`, `tr`, `cut`, `wc`, `head`, `tail`, `date`, `mktemp`, `tput` | Planning, reports, the progress line |
+| `nohup`, `ps`, `pgrep`, `kill` | Background mode, `--stop` (stops every rsync the copy started), locks |
+| `awk`, `sed`, `grep`, `sort` (file lists; sorts in the destination's log folder), `find`, `xargs`, `tr`, `cut`, `wc`, `head`, `tail`, `date`, `mktemp`, `tput` | Planning, reports, the progress line |
 | `dd`, `split`, `/usr/bin/time` | `--speed-test` only |
 | `man` (mandoc) | Reading the man page |
 | `install`, `xattr` | `install.sh` only: copying files into place, removing the download flag |

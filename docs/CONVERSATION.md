@@ -97,8 +97,16 @@ Any hash has to read every byte, so hashing alone doesn't skip reading. Saving t
 - `install.sh` puts the program in `/usr/local/bin/smartcopy` and the manual where `man` looks.
 - Installing an update while an old copy is still running is safe, because a running script keeps its own copy open. The old copy's log folder must stay until it finishes, and a second copy to the same destination must wait.
 
+## 17. Faster, before a new transfer engine
+"Perform a comprehensive algorithmic performance audit… eliminate all avoidable computational and filesystem overhead", with baselines measured first, privacy rules checked by automated tests, and results measured before and after. This led to **v12.3**:
+- Baselines first: a Linux test bed with loop-mounted drives and stand-ins for the macOS tools measured CPU, memory, system calls, time to first transfer, throughput and time to a verified finish (`bench/`).
+- The list handling was rebuilt around sorted, merged lists in a filename-safe format, so its cost grows in step with the number of files and its memory stays bounded. Batch output is read once, and the progress line is computed in the shell.
+- Measuring exposed real bugs: a finished check made the next `--verify-only` skip everything; a stopped copy lost its fingerprints; names with tabs or line breaks failed; and incremental listing with hard links could hang.
+- Automated tests (`tests/run.sh`) check the privacy rules: nothing written outside the destination, no names on screen or in reports, no network, a safe pause when the destination is unplugged.
+
 ## Lessons
 - **Test stand-ins must behave like the real thing.** A `caffeinate` stand-in that exited at once, and a `df` stand-in that printed single spaces, each hid a bug that broke the first real run.
 - **Measure before optimising.** The 26 MB/s speed came from the destination's format and the source drive, not from the script.
 - **Plain English matters.** "rsync error code 23" helps nobody; "2 files could not be read, the source drive reported read errors, here's what to do" does.
+- **A fast result can be a wrong result.** The old `--verify-only` rerun was quick because it checked nothing. Test what a step proves, not only how long it takes.
 - **Privacy has to be designed in from the start.** Logs, temporary files and progress lines are easy places for file names to leak.

@@ -1,0 +1,4 @@
+#!/bin/bash
+# Test stand-in for macOS caffeinate -w PID: wait for the process to exit.
+while [ $# -gt 0 ]; do case "$1" in -w) shift; pid=$1 ;; esac; shift; done
+while kill -0 "${pid:-0}" 2>/dev/null; do sleep 1; done

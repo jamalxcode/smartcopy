@@ -1,4 +1,4 @@
-.TH SMARTCOPY 1 "2026-11-24" "smartcopy v12.2" "User Commands"
+.TH SMARTCOPY 1 "2026-11-24" "smartcopy v12.3" "User Commands"
 .SH NAME
 smartcopy \- resumable, self-checking copy of a drive or folder on macOS, with a plain-English report
 .SH SYNOPSIS
@@ -213,8 +213,22 @@ on the destination, while copying and while checking. After that, files with a s
 checked by reading
 .B only the destination
 \(em usually much faster when the source is the slower drive \(em and a backup can be re-checked even
-without the source connected. Files that changed on the source since they were copied are always
-compared with the source instead.
+without the source connected. A fingerprint is only used while the source file still has the size and
+modification date it had when the fingerprint was taken; files that changed on the source since are
+always compared with the source instead.
+.PP
+Fingerprints of copied files are saved as each batch finishes, so a copy that is stopped or cut off
+keeps them, and the check after resuming still reads only the destination for those files.
+.PP
+A stopped check resumes where it stopped: files it already confirmed are skipped, unless the source
+file changed since. Once a check has finished, the next one checks every file again.
+.SH FINAL PASS
+When every file was copied cleanly and the check will run, the final pass only visits the folders and
+links (to create them and set their dates), not every file; the check that follows then goes through
+everything. With
+.BR \-\-no\-verify ,
+after any copying problem, or when the source has hard links, the final pass goes through every file,
+as a safety net.
 .SH PRIVACY AND WHERE FILES ARE WRITTEN
 File names are never shown on screen, in the report or in notifications. Where it matters which files
 are affected, the report gives a count and points to a private file list.
@@ -259,6 +273,15 @@ Stops two copies writing to the same destination at the same time.
 .TP
 .I .verified\-*
 Which files a stopped check has already confirmed, so it can resume.
+.TP
+.I .hashes\-*
+Fingerprints gathered by a run that haven't been added to
+.I .smartcopy\-hashes
+yet (for example because the run was cut off); the next run adds them.
+.TP
+.I .run\-PID\-STAMP/
+Working files of a run (file lists, batches, temporary files). Removed when the run ends; one left by
+a crash is removed by the next run.
 .PP
 In the destination folder:
 .TP
@@ -348,8 +371,6 @@ exFAT destinations work but are slower on a Mac and don't keep owners, permissio
 symbolic links. For Mac-only drives, APFS is faster and keeps everything.
 .IP \(bu 3
 This makes a data copy, not a bootable clone of a macOS system.
-.IP \(bu 3
-File names containing a tab or a line break aren't supported.
 .SH SEE ALSO
 .BR rsync (1),
 .BR diskutil (8),

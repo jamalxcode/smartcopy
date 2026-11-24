@@ -1,0 +1,10 @@
+#!/bin/bash
+# Test stand-in for macOS diskutil. Reports a filesystem type from $SC_TEST_FS (default apfs).
+case "$1" in
+  info) echo "   Volume UUID:               TEST-UUID-$(printf '%s' "$2" | cksum | cut -d' ' -f1)"
+        echo "   Type (Bundle):             ${SC_TEST_FS:-apfs}"
+        echo "   Solid State:               ${SC_TEST_SSD:-Yes}"
+        echo "   Owners:                    Enabled" ;;
+  enableOwnership) exit 0 ;;
+esac
+exit 0

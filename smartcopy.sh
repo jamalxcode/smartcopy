@@ -1,5 +1,5 @@
 #!/bin/bash
-# smartcopy v12.2 — resumable, self-healing copy of a drive OR a folder on macOS, with checksum
+# smartcopy v12.3 — resumable, self-healing copy of a drive OR a folder on macOS, with checksum
 # verification and a plain-English report of every problem, with steps to fix and avoid it.
 #
 #   sudo smartcopy SOURCE DESTINATION                copy (asks to confirm the first time)
@@ -30,9 +30,22 @@
 
 set -u
 
+TAB="$(printf '\t')"
 ts()   { date '+%F %T'; }
 usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
-hk()   { awk -v k="${1:-0}" 'BEGIN{split("KB MB GB TB PB",u);i=1;while(k>=1024&&i<5){k/=1024;i++};printf "%.1f %s",k,u[i]}'; }
+# hk_v VAR KB: a size in KB as "12.3 GB", stored in VAR (pure shell: no subprocess)
+hk_v() {
+  local _var="$1" k="${2:-0}" i=0 d=1 x
+  local -a u=(KB MB GB TB PB)
+  k="${k%%.*}"; case "$k" in ''|*[!0-9]*) k=0 ;; esac
+  while [ "$i" -lt 4 ] && [ "$k" -ge $(( d * 1024 )) ]; do d=$(( d * 1024 )); i=$(( i + 1 )); done
+  x=$(( (k * 10 + d / 2) / d ))
+  printf -v "$_var" '%d.%d %s' $(( x / 10 )) $(( x % 10 )) "${u[i]}"
+}
+hk() { local _h; hk_v _h "${1:-0}"; printf '%s' "$_h"; }
+# words "STRING" VAR...: split a line of numbers into variables. (Here-documents are avoided on
+# purpose: macOS's bash 3.2 writes them to temporary files, possibly on the Mac's own drive.)
+words() { local _s="$1" _v _i=0; shift; local -a _w; _w=($_s); for _v in "$@"; do printf -v "$_v" '%s' "${_w[_i]:-0}"; _i=$(( _i + 1 )); done; }
 # Word-wrap stdin: wrap FIRST_INDENT REST_INDENT
 wrap() {
   awk -v f="$1" -v r="$2" -v w=78 '{ line=""; first=1; n=split($0,a," ")
@@ -42,6 +55,242 @@ wrap() {
       else line=line " " a[i] }
     if (line!="") print line }'
 }
+
+# ============================ File-list library ============================
+# Everything that handles lists of files lives here, so it can be tested on its own
+# (SMARTCOPY_LIB=1 . smartcopy.sh loads just this part).
+#
+# Record format: one line per file, fields separated by tabs. A file name is stored the way
+# rsync prints it (control characters as \#ooo, and a backslash before # as \#134) with tabs
+# also written as \#011, so a stored name never contains a tab or a line break, whatever
+# characters the real name has. unesc() turns it back into the real name, which is handed to
+# rsync as a NUL-separated list (--from0), so every legal file name works.
+#
+#   plan        name  size  mtime  T|-          every source file; T = still needs copying
+#   fingerprint name  size  mtime  hash         .smartcopy-hashes (sorted, after one header line)
+#   journal     name  size  mtime  hash         new fingerprints, appended while copying/checking
+#   checkpoint  name  size  mtime               files a stopped check already confirmed
+#
+# size and mtime are the SOURCE file's at the moment its fingerprint was taken, so a fingerprint
+# or checkpoint is only reused while the source file still has that size and date.
+# Lists are sorted by name in byte order (LC_ALL=C), and lists are combined by merging sorted
+# streams, so memory stays bounded by sort's buffer however many files there are.
+SORT_MEM="${SMARTCOPY_SORT_MEM:-256M}"
+csort() { LC_ALL=C sort -t "$TAB" -S "$SORT_MEM" -T "${TMPDIR:?}" "$@"; }
+
+AWK_LIB='
+function unesc(s,   out, o) {
+  out = ""
+  while (match(s, /\\#[0-7][0-7][0-7]/)) {
+    o = substr(s, RSTART + 2, 1) * 64 + substr(s, RSTART + 3, 1) * 8 + substr(s, RSTART + 4, 1)
+    out = out substr(s, 1, RSTART - 1) sprintf("%c", o); s = substr(s, RSTART + 5)
+  }
+  return out s
+}
+function safe(s,   i) {
+  while ((i = index(s, "\t")) > 0) s = substr(s, 1, i - 1) "\\#011" substr(s, i + 1)
+  return s
+}
+# item(line, F, withC): split an rsync line "%i %l %M [%C] %n" into F[i,l,m,c,n]; 0 = not an item
+function item(s, F, withC,   r, j) {
+  if (substr(s, 12, 1) != " " || substr(s, 1, 2) !~ /^[<>ch.*][fdLDS]$/) return 0
+  F["i"] = substr(s, 1, 11); r = substr(s, 13)
+  j = index(r, " "); if (!j) return 0; F["l"] = substr(r, 1, j - 1); r = substr(r, j + 1)
+  j = index(r, " "); if (!j) return 0; F["m"] = substr(r, 1, j - 1); r = substr(r, j + 1)
+  F["c"] = ""
+  if (withC) { F["c"] = substr(r, 1, 32); r = substr(r, 34); if (F["c"] !~ /^[0-9a-f]+$/) F["c"] = "" }
+  F["n"] = safe(r)
+  return F["l"] ~ /^[0-9]+$/
+}'
+
+# scan_parse ALL OTHER SUM < rsync -ii --out-format='%i %l %M %n' output
+# ALL: plan records (unsorted). OTHER: folders, links and other non-files (for the final pass).
+# SUM: "files bytes todo_files todo_bytes others hardlinks".
+scan_parse() {
+  LC_ALL=C awk -v all="$1" -v other="$2" -v sum="$3" "$AWK_LIB"'
+    item($0, F, 0) {
+      t = substr(F["i"], 2, 1); c = substr(F["i"], 1, 1); n = F["n"]
+      if (t == "f") {
+        if (c == "h") { nh++; print n > other; next }          # hard link: made by the final pass
+        if (c != "." && c != ">") next
+        todo = (c == ">") ? "T" : "-"
+        print n "\t" F["l"] "\t" F["m"] "\t" todo > all
+        nf++; nb += F["l"]; if (todo == "T") { tf++; tb += F["l"] }
+      } else {
+        if (n == "./") n = "."; else sub(/\/$/, "", n)
+        print n > other; no++
+      }
+    }
+    END { printf "%d %.0f %d %.0f %d %d\n", nf, nb, tf, tb, no, nh > sum; close(sum); close(all); close(other) }'
+}
+
+# nul_list < stored names -> real names, NUL-separated (for rsync --from0 --files-from)
+nul_list() { LC_ALL=C awk -F'\t' "$AWK_LIB"'{ printf "%s%c", unesc($1), 0 }'; }
+
+# make_batches LIST PREFIX copy|check|hash TOTAL_BYTES
+# Cuts a sorted list into batches of ~1-8 GB or 5000 files (in folder order): PREFIX.0001 (NUL
+# name list for rsync), PREFIX.0001.rec (the records, for check/hash) and PREFIX.sizes.
+# copy uses only the files marked T. Sets NB, BSIZE[], BCOUNT[].
+make_batches() {
+  local list="$1" pre="$2" mode="$3" total="${4:-0}" target b sz cnt
+  total="${total%%.*}"; target=$(( total / 64 ))
+  [ "$target" -lt 1073741824 ] && target=1073741824; [ "$target" -gt 8589934592 ] && target=8589934592
+  : > "$pre.sizes" || return 1
+  LC_ALL=C awk -F'\t' -v pre="$pre" -v tgt="$target" -v mode="$mode" "$AWK_LIB"'
+    function done_batch() { close(f); if (mode != "copy") close(r); printf "%d %.0f %d\n", b, acc, n > (pre ".sizes") }
+    mode == "copy" && $4 != "T" { next }
+    { if (b == 0 || acc >= tgt || n >= 5000) {
+        if (b) done_batch()
+        b++; acc = 0; n = 0; f = sprintf("%s.%04d", pre, b); r = f ".rec" }
+      printf "%s%c", unesc($1), 0 > f
+      if (mode == "check") print $1 "\t" $2 "\t" $3 > r
+      else if (mode == "hash") print $1 "\t" $2 "\t" $3 "\t" $4 > r
+      acc += $2; n++ }
+    END { if (b) done_batch(); close(pre ".sizes") }' "$list" || return 1
+  NB=0; BSIZE=(); BCOUNT=()
+  while read -r b sz cnt; do BSIZE[b]=$sz; BCOUNT[b]=$cnt; NB=$b; done < "$pre.sizes"
+}
+
+# The awk part shared by the merges below: lines arrive grouped by name (any order inside a
+# group) and are told apart by their shape: plan (4th field T or -), checkpoint (V), sorted
+# journal (5th field J), new journal entries (5th field = sequence number), else fingerprint.
+MERGE_LIB='
+function reset() { havep = 0; ps = pm = vs = vm = js = jm = jh = ms = mm = mh = ""; nseq = -1 }
+function take(  ) {
+  if (NF < 4) return
+  if (NF == 5) {
+    if ($5 == "J") { if (nseq < 0) { js = $2; jm = $3; jh = $4 } }
+    else if ($5 + 0 > nseq) { nseq = $5 + 0; js = $2; jm = $3; jh = $4 }
+  }
+  else if ($4 == "T" || $4 == "-") { havep = 1; ps = $2; pm = $3 }
+  else if ($4 == "V") { vs = $2; vm = $3 }
+  else { ms = $2; mm = $3; mh = $4 }
+}
+# latest(): the newest fingerprint in the group -> L[s,m,h]; 0 if none
+function latest(L) {
+  if (jh != "") { L["s"] = js; L["m"] = jm; L["h"] = jh; return 1 }
+  if (mh != "") { L["s"] = ms; L["m"] = mm; L["h"] = mh; return 1 }
+  return 0
+}'
+
+# journal_fold SORTED_JOURNAL NEW_FILE... : sort the new entries once and merge them into the sorted
+# journal (newest wins), replacing it atomically. Each entry is sorted exactly once.
+journal_fold() {
+  local cj="$1" tmp="$1.tmp.$$" srt="$1.new.$$"; shift
+  [ $# -gt 0 ] || return 0
+  ( set -o pipefail
+    cat "$@" | LC_ALL=C awk -F'\t' -v OFS='\t' 'NF == 4 { print $0, NR }' | csort -k1,1 > "$srt" || exit 1
+    { if [ -s "$cj" ]; then csort -m -k1,1 "$cj" "$srt"; else cat "$srt"; fi; } \
+      | LC_ALL=C awk -F'\t' "$MERGE_LIB"'
+          function flush(  L) { if (latest(L)) print cur "\t" L["s"] "\t" L["m"] "\t" L["h"] "\tJ"; reset() }
+          BEGIN { reset() } $1 != cur { if (NR > 1) flush(); cur = $1 } { take() } END { if (NR) flush() }' > "$tmp" \
+      && mv -f "$tmp" "$cj" ) || { rm -f "$tmp" "$srt"; return 1; }
+  rm -f "$srt" "$@"
+}
+
+# select_checks PLAN FINGERPRINTS|"" SORTED_JOURNAL|"" SORTED_CHECKPOINT|"" HASHLIST FULLLIST
+# Decides how each planned file is checked: skipped (confirmed by a stopped check and unchanged on the
+# source), destination-only (a fingerprint taken from the source at its current size and date) or
+# full (compared with the source). Prints "skipped hash_files hash_bytes full_files full_bytes".
+select_checks() {
+  local plan="$1" man="$2" cj="$3" vs="$4" hc="$5" full="$6"
+  ( set -o pipefail
+    csort -m -k1,1 "$plan" ${man:+"$man"} ${cj:+"$cj"} ${vs:+"$vs"} \
+    | LC_ALL=C awk -F'\t' -v hc="$hc" -v full="$full" "$MERGE_LIB"'
+        function flush(  L) {
+          if (havep) {
+            if (vs != "" && vs == ps && vm == pm) sk++
+            else if (latest(L) && L["s"] == ps && L["m"] == pm) { print cur "\t" ps "\t" pm "\t" L["h"] > hc; hn++; hb += ps }
+            else { print cur "\t" ps "\t" pm > full; fn++; fb += ps }
+          }
+          reset() }
+        BEGIN { reset(); printf "" > hc; printf "" > full }
+        $1 != cur { if (NR > 1) flush(); cur = $1 } { take() }
+        END { if (NR) flush(); close(hc); close(full); printf "%d %d %.0f %d %.0f\n", sk, hn, hb, fn, fb }' )
+}
+
+# manifest_write OUT ALGO SORTED_JOURNAL FINGERPRINTS|"" PLAN|""
+# Writes a new fingerprint list: the old one merged with the journal (newest wins). Given a plan,
+# keeps only files that still exist with the same size and date (so the list never goes stale).
+manifest_write() {
+  local out="$1" algo="$2" cj="$3" man="$4" plan="$5"
+  ( set -o pipefail
+    { echo "#smartcopy-hashes v2 algo=$algo"
+      csort -m -k1,1 "$cj" ${man:+"$man"} ${plan:+"$plan"} \
+      | LC_ALL=C awk -F'\t' -v prune="${plan:+1}" "$MERGE_LIB"'
+          function flush(  L) {
+            if (latest(L) && (!prune || (havep && L["s"] == ps && L["m"] == pm))) print cur "\t" L["s"] "\t" L["m"] "\t" L["h"]
+            reset() }
+          BEGIN { reset() } $1 != cur { if (NR > 1) flush(); cur = $1 } { take() } END { if (NR) flush() }'
+    } > "$out" )
+}
+
+# harvest_copy RSYNC_OUTPUT JOURNAL: fingerprints of copied files -> journal; prints "bytes files"
+harvest_copy() {
+  [ -f "$1" ] || { echo "0 0"; return; }
+  LC_ALL=C awk -v j="$2" "$AWK_LIB"'
+    item($0, F, 1) && substr(F["i"], 1, 2) == ">f" {
+      n++; b += F["l"]; if (F["c"] != "") print F["n"] "\t" F["l"] "\t" F["m"] "\t" F["c"] >> j }
+    END { printf "%.0f %d\n", b, n }' "$1" 2>/dev/null | tail -1
+}
+
+# finish_check RSYNC_OUTPUT JOURNAL DIFFLOG: one full-check batch, read once. Matching files'
+# source fingerprints -> journal, differences -> DIFFLOG. Prints "bytes files differences".
+finish_check() {
+  [ -f "$1" ] || { echo "0 0 1"; return; }
+  LC_ALL=C awk -v j="$2" -v d="$3" "$AWK_LIB"'
+    item($0, F, 1) {
+      i = F["i"]; fl = substr(i, 3); gsub(/ /, "", fl)
+      if (substr(i, 2, 1) == "f") { n++; b += F["l"] }
+      if (i ~ /^[<>c*]/ || fl != "") { print i " " F["n"] >> d; nd++ }
+      else if (i ~ /^[.h]f/ && F["c"] != "") print F["n"] "\t" F["l"] "\t" F["m"] "\t" F["c"] >> j
+    }
+    END { printf "%.0f %d %d\n", b, n, nd }' "$1" 2>/dev/null | tail -1
+}
+
+# finish_hash BATCH_RECORDS RSYNC_OUTPUT DIFFLOG: one destination-only batch. Only this batch'"'"'s
+# expected fingerprints are held in memory. Prints "bytes files differences".
+finish_hash() {
+  [ -f "$1" ] && [ -f "$2" ] || { echo "0 0 1"; return; }
+  LC_ALL=C awk -F'\t' -v d="$3" -v rec="$1" "$AWK_LIB"'
+    FILENAME == rec { want[$1] = $4; next }
+    item($0, F, 1) && substr(F["i"], 2, 1) == "f" { got[F["n"]] = F["c"]; n++; b += F["l"] }
+    END { for (p in want) if (!(p in got) || got[p] != want[p]) { print ">fc........ " p >> d; nd++ }
+          printf "%.0f %d %d\n", b, n, nd }' "$1" "$2" 2>/dev/null | tail -1
+}
+
+# progress_count copy|check FILE...: bytes and files done so far in the batches still running
+progress_count() {
+  local m="$1" f; shift
+  local -a have=(); for f in "$@"; do [ -f "$f" ] && have+=("$f"); done
+  [ ${#have[@]} -gt 0 ] || { echo "0 0"; return; }
+  set -- "${have[@]}"
+  LC_ALL=C awk -v m="$m" 'm == "copy" && substr($0, 1, 2) == ">f" { s += $2; n++; next }
+    m != "copy" && substr($0, 2, 1) == "f" && $2 ~ /^[0-9]+$/ { s += $2; n++ }
+    END { printf "%.0f %d\n", s, n }' "$@" 2>/dev/null | tail -1
+}
+
+# copy_stats LOG: "files bytes copied_twice" — each copied file counted once
+copy_stats() {
+  ( set -o pipefail
+    LC_ALL=C awk "$AWK_LIB"'item($0, F, 1) && substr(F["i"], 1, 2) == ">f" { print F["n"] "\t" F["l"] }' "$1" \
+    | csort -k1,1 -s | LC_ALL=C awk -F'\t' '
+        function flush() { if (p != "") { u++; ub += sz; if (c > 1) tw++ } }
+        $1 != p { flush(); p = $1; c = 0 } { c++; sz = $2 } END { flush(); printf "%d %.0f %d\n", u, ub, tw }' ) 2>/dev/null \
+  || echo "0 0 0"
+}
+
+# diff_summary DIFFLOG REPAIRLIST: unique differing items, items differing only in details, and the
+# list of differing files to copy again. Prints "differences detail_differences".
+diff_summary() {
+  local log="$1" rl="$2" d m
+  d=$( LC_ALL=C awk '/^[<>ch*]/ { s = $0; sub(/^[^ ]* /, "", s); print s }' "$log" | csort -u | wc -l | tr -d ' ' )
+  LC_ALL=C awk '/^[<>ch*]f/ { s = $0; sub(/^[^ ]* /, "", s); print s }' "$log" | csort -u > "$rl"
+  m=$( csort -u "$log" | LC_ALL=C awk '$1 ~ /^\./ { f = (substr($1,2,1)=="d") ? substr($1,6) : substr($1,5); if (f ~ /[tpogaxnb]/) c++ } END { print c+0 }' )
+  echo "${d:-0} ${m:-0}"
+}
+
+[ "${SMARTCOPY_LIB:-}" = 1 ] && return 0 2>/dev/null
 
 SELF="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
 REPORT_ON=0
@@ -69,6 +318,9 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
+
+# The report is kept in memory until it's written (on the destination drive only)
+ISSUES_TXT=""; NOTES_TXT=""; NP=0; NN=0
 
 # fatal TITLE WHAT FIX AVOID [SIDE] — stop, and explain in the report (or on screen before logging starts)
 fatal() {
@@ -111,10 +363,16 @@ logbase_for() {
   local v; v="$(volume_of "$1")"
   case "$v" in /Volumes/?*) printf '%s/rsync-logs' "$v" ;; *) printf '%s/rsync-logs' "$1" ;; esac
 }
-lock_path() { echo "$(logbase_for "$1")/locks/$(printf '%s' "$1" | shasum | cut -c1-12).lock"; }
+dest_key()  { printf '%s' "$1" | shasum | cut -c1-12; }
+lock_path() { echo "$(logbase_for "$1")/locks/$(dest_key "$1").lock"; }
+is_ours()   { kill -0 "$1" 2>/dev/null && ps -p "$1" -o command= 2>/dev/null | grep -qE 'smartcopy|safe-copy'; }
 lock_pid()  {   # PID of the live smartcopy process holding this lock, if any
   local p; p=$(cat "$1/pid" 2>/dev/null)
-  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && ps -p "$p" -o command= 2>/dev/null | grep -qE 'smartcopy|safe-copy' && echo "$p"
+  [ -n "$p" ] && is_ours "$p" && echo "$p"
+}
+kill_tree() {   # stop a process's children and grandchildren (rsync workers, list scans, sleep)
+  local c
+  for c in $(pgrep -P "$1" 2>/dev/null); do kill_tree "$c"; kill -TERM "$c" 2>/dev/null; done
 }
 
 # ---------------- --stop ----------------
@@ -122,7 +380,7 @@ if [ "$STOP" -eq 1 ]; then
   [ ${#POS[@]} -eq 1 ] || usage 1
   target="$(resolve "$(abspath "${POS[0]}")")"
   pid=$(lock_pid "$(lock_path "$target")") || fatal "No copy to $target is running."
-  pkill -TERM -P "$pid" 2>/dev/null   # rsync, sleep, caffeinate
+  kill_tree "$pid"   # rsync, sleep, caffeinate
   kill -TERM "$pid" 2>/dev/null
   echo "Stopped the copy (PID $pid). Run the same copy command again to resume."
   exit 0
@@ -166,56 +424,102 @@ done
   "Install Homebrew from https://brew.sh if you don't have it
 Then run: brew install rsync   (or brew upgrade rsync if it's already installed)"
 RSYNC_CAPS="$("$RSYNC" --version 2>/dev/null | tr ',' '\n' | sed 's/^ *//')"
-has_cap() { printf '%s\n' "$RSYNC_CAPS" | grep -qx "$1"; }
+has_cap() { case "$TAB$(printf '%s' "$RSYNC_CAPS" | tr '\n' "$TAB")$TAB" in *"$TAB$1$TAB"*) return 0 ;; esac; return 1; }
 MAC_FLAGS="-aH"                       # archive + hard links
 has_cap ACLs    && MAC_FLAGS="${MAC_FLAGS}A"
 has_cap xattrs  && MAC_FLAGS="${MAC_FLAGS}X"
 has_cap crtimes && MAC_FLAGS="${MAC_FLAGS}N"
 # xxh128 checksums are many times faster to compute than rsync's default MD5 — same safety for this job
 CSUM=(); printf '%s\n' "$RSYNC_CAPS" | grep -qw xxh128 && CSUM=(--checksum-choice=xxh128)
+HALGO="${CSUM[0]:-}"; HALGO="${HALGO#--checksum-choice=}"; HALGO="${HALGO:-default}"
 
 # ---------------- Logs and report ----------------
 # Names are set here; the folder itself is created by init_logs() only after the destination drive
 # is confirmed mounted, so nothing can ever land on the Mac's own drive.
 LOGDIR="$(logbase_for "$DST")"
 STAMP="$(date +%Y%m%d-%H%M%S)"
-LOG="$LOGDIR/copy-$STAMP.log"            # everything rsync did
-REPORT="$LOGDIR/report-$STAMP.txt"       # the plain-English report
-VERIFYLOG="$LOGDIR/verify-$STAMP.txt"
-FAILED="$LOGDIR/affected-files-$STAMP.txt"
-PASSLOG="$LOGDIR/.pass-$STAMP.log"; PASSERR="$LOGDIR/.passerr-$STAMP"
-ALLERR="$LOGDIR/.allerr-$STAMP";   FINALERR="$LOGDIR/.finalerr-$STAMP"
-ISSUES="$LOGDIR/.issues-$STAMP";   NOTES="$LOGDIR/.notes-$STAMP"
+set_log_names() {
+  LOG="$LOGDIR/copy-$STAMP.log"            # everything rsync did
+  REPORT="$LOGDIR/report-$STAMP.txt"       # the plain-English report
+  VERIFYLOG="$LOGDIR/verify-$STAMP.txt"
+  FAILED="$LOGDIR/affected-files-$STAMP.txt"
+  RUNDIR="$LOGDIR/.run-$$-$STAMP"          # this run's working files; removed when it ends
+  PASSLOG="$RUNDIR/pass.log"; PASSERR="$RUNDIR/pass.err"
+  ALLERR="$RUNDIR/all.err";   FINALERR="$RUNDIR/final.err"
+}
+set_log_names
 RESULT="❌ Did not finish — see below."
 BATCH_SECS=0; BATCH_BYTES=0; TOTAL_PASSES=0; LOOPS=0; SRC_DROPS=0; DST_DROPS=0; STARTED=0; COPY_SECS=0; PREV_UNFINISHED=0
-OWN_LOCK=0; SPOT_WAS_ON=0; SPOT_NOTE=""; LOGS_READY=0
+OWN_LOCK=0; SPOT_WAS_ON=0; SPOT_NOTE=""; LOGS_READY=0; PLAN_COMPLETE=0; PLAN=""
+COPIED_FILES=0; COPIED_BYTES=0
+VOLUMES_DEV="$(dev_of /Volumes)"
+
+# Is the current directory really on the destination drive (not a leftover folder on the Mac's drive)?
+on_dst_volume() {
+  case "$DST_VOL" in /Volumes/?*) [ -n "$VOLUMES_DEV" ] && [ "$(dev_of .)" != "$VOLUMES_DEV" ] ;; *) return 0 ;; esac
+}
+# in_dst CMD...: run CMD with the destination folder as its working directory, or exit 98 if the
+# destination drive isn't really there. Writing through the working directory means that if the
+# drive is unplugged, writes fail — they can never land in a folder on the Mac's own drive.
+# Use as "in_dst ... &" (background) or "( in_dst ... )" (foreground): it replaces its process.
+in_dst() { cd "$DST" 2>/dev/null && on_dst_volume || exit 98; exec "$@"; }
+
 init_logs() {
-  mkdir -p "$LOGDIR/locks" || fatal "Couldn't create the log folder on the destination drive ($LOGDIR)." \
+  local d pid
+  if [ "${LOGDIR%/rsync-logs}" = "$DST_VOL" ]; then   # on the drive itself: create it from inside the drive
+    ( cd "$DST_VOL" 2>/dev/null && on_dst_volume && mkdir -p rsync-logs/locks )
+  else
+    mkdir -p "$LOGDIR/locks"
+  fi || fatal "Couldn't create the log folder on the destination drive ($LOGDIR)." \
     "The drive may be read-only or full." "Check the drive in Finder, run Disk Utility > First Aid on it, then run the same command again."
   chflags hidden "$LOGDIR" 2>/dev/null          # out of sight in Finder (Cmd-Shift-. shows hidden items)
   chmod 700 "$LOGDIR" 2>/dev/null               # private on APFS/HFS drives
-  : > "$ISSUES"; : > "$NOTES"; : > "$ALLERR"; : > "$FINALERR"
+  for d in "$LOGDIR"/.run-*; do                 # working files left by a run that crashed
+    [ -d "$d" ] || continue
+    pid="${d##*/.run-}"; pid="${pid%%-*}"
+    is_ours "$pid" || rm -rf "$d"
+  done
+  mkdir -p "$RUNDIR/tmp" || fatal "Couldn't create the log folder on the destination drive ($LOGDIR)." \
+    "The drive may be read-only or full." "Check the drive in Finder, run Disk Utility > First Aid on it, then run the same command again."
+  # Every temporary file any tool makes (sort, the shell) goes here, on the destination drive
+  TMPDIR="$RUNDIR/tmp"; export TMPDIR
+  : > "$ALLERR"; : > "$FINALERR"
   LOGS_READY=1; REPORT_ON=1
+}
+drives_here() { is_mounted "$SRC_VOL" && is_mounted "$DST_VOL" && [ -d "$RUNDIR" ]; }
+logs_here() {   # the log folder can be written: logs set up, and the destination drive is connected
+  [ "$LOGS_READY" -eq 1 ] && is_mounted "$DST_VOL" && [ -d "$LOGDIR" ]
 }
 
 # add_issue PROBLEM|NOTE SIDE TITLE WHAT FIX AVOID [EXAMPLES]  (FIX/AVOID/EXAMPLES: one item per line)
 add_issue() {
-  local out="$NOTES"; [ "$1" = PROBLEM ] && out="$ISSUES"
-  {
+  local block
+  block="$(
     echo "■ [$2] $3"
     [ -n "$4" ] && printf '%s\n' "$4" | wrap "    " "    "
     if [ -n "${7:-}" ]; then
       echo "    Which files: listed in your private file list (see the end of this report)."
-      [ "$7" = "__LISTED__" ] || { echo "== $3"; printf '%s\n' "$7"; echo; } >> "$FAILED"
+      [ "$7" = "__LISTED__" ] || { echo "== $3"; printf '%s\n' "$7"; echo; } >> "$FAILED" 2>/dev/null
     fi
     if [ -n "$5" ]; then echo "    How to fix:";               printf '%s\n' "$5" | wrap "      • " "        "; fi
     if [ -n "$6" ]; then echo "    How to avoid it next time:"; printf '%s\n' "$6" | wrap "      • " "        "; fi
-    echo
-  } >> "$out"
+  )"
+  if [ "$1" = PROBLEM ]; then ISSUES_TXT="$ISSUES_TXT$block
+
+"; NP=$(( NP + 1 ))
+  else NOTES_TXT="$NOTES_TXT$block
+
+"; NN=$(( NN + 1 )); fi
 }
-dinfo() { diskutil info "$1" 2>/dev/null | awk -F': *' -v k="$2" '$1 ~ k {print $2; exit}'; }
+# Drive details from diskutil, read once per drive (load_dinfo) and looked up from memory
+DI_SRC=""; DI_DST=""
+load_dinfo() { DI_SRC="$(diskutil info "$SRC_VOL" 2>/dev/null)"; DI_DST="$(diskutil info "$DST_VOL" 2>/dev/null)"; }
+dinfo() {
+  local t=""; [ "$1" = "$SRC_VOL" ] && t="$DI_SRC"; [ "$1" = "$DST_VOL" ] && t="$DI_DST"
+  printf '%s\n' "$t" | awk -F': *' -v k="$2" '$1 ~ k {print $2; exit}'
+}
 give_logs_back() {
-  [ "$LOGS_READY" -eq 1 ] && [ -d "$LOGDIR" ] || return 0
+  logs_here || return 0
   [ -n "${SUDO_USER:-}" ] && chown -R "$SUDO_USER" "$LOGDIR" 2>/dev/null
   chmod -R go-rwx "$LOGDIR" 2>/dev/null       # private: only your Mac account can open the logs
   return 0
@@ -236,7 +540,9 @@ is_mounted() {
   a=$(dev_of "$1"); b=$(dev_of "$(dirname "$1")")
   [ -n "$a" ] && [ -n "$b" ] && [ "$a" != "$b" ]
 }
-dst_used_k() { is_mounted "$DST_VOL" && df -kP "$DST_VOL" 2>/dev/null | tail -1 | awk '{print $3}'; }
+dst_used_k() {   # space used on the destination drive, from a single df (empty if it isn't mounted there)
+  df -kP "$DST_VOL" 2>/dev/null | awk -v v="$DST_VOL" '{ m = $0; u = $3 } END { sub(/.*%[[:space:]]+/, "", m); if (m == v || v == "/") print u }'
+}
 
 # A plain folder at /Volumes/Name stops the drive mounting there (it comes back as "Name 1").
 clear_stale_mountpoint() {
@@ -279,7 +585,7 @@ wait_for_mounts() {
 # ============================ Error analysis (for the report) ============================
 error_lines() {   # unique error/warning messages from rsync output files
   cat "$@" 2>/dev/null | sed -E 's/^[0-9\/]+ [0-9:]+ \[[0-9]+\] //' \
-    | grep -E '^(rsync( error)?:|file has vanished|WARNING: .*failed verification|ERROR: .*failed verification)' | sort -u
+    | grep -E '^(rsync( error)?:|file has vanished|WARNING: .*failed verification|ERROR: .*failed verification|could not make way for|cannot delete non-empty directory)' | csort -u
 }
 # -> SIDE <tab> CATEGORY <tab> PATH
 classify() {
@@ -287,6 +593,7 @@ classify() {
   { l=$0; m=l; gsub(/"[^"]*"/, "", m)          # m = message without file names
     if (m ~ /^rsync error:/) {
       if (m ~ /protocol data stream|error in IPC|unexpectedly closed|socket IO/) cat="crashed"; else next }
+    else if (m ~ /^could not make way for|^cannot delete non-empty directory/) cat="inway"
     else if (m ~ /file has vanished/)                    cat="vanished"
     else if (m ~ /failed verification/)                  cat="verifyfail"
     else if (m ~ /No space left on device|quota exceeded/) cat="nospace"
@@ -309,7 +616,9 @@ classify() {
     else if (index(l, "\"" dst) || index(l, " " dst)) side="DESTINATION"
     else if (l ~ /\[sender\]/) side="SOURCE"
     else if (l ~ /\[(receiver|generator)\]/) side="DESTINATION"
+    if (cat=="inway") side="DESTINATION"
     path=""; if (match(l, /"[^"]+"/)) path=substr(l, RSTART+1, RLENGTH-2)
+    else if (cat=="inway") { path=l; sub(/^[^:]*: /, "", path); path=dst path }
     else if (cat=="verifyfail") { path=l; sub(/^(WARNING|ERROR): /, "", path); sub(/ failed verification.*$/, "", path); path=src path }
     if (match(path, /\/\.[^\/]+\.[A-Za-z0-9]{6}$/)) {          # rsync temp file -> real name
       b=substr(path, RSTART+2); sub(/\.[A-Za-z0-9]{6}$/, "", b); path=substr(path, 1, RSTART) b }
@@ -322,7 +631,7 @@ cat_name() {
     notpermitted) echo "blocked by macOS protection";; nospace) echo "drive full";; readonly) echo "read-only drive";;
     crashed) echo "copy process cut off";; missing) echo "files or folders went missing";; vanished) echo "files changed during the copy";;
     verifyfail) echo "files damaged in transit";; badname) echo "file names not allowed";; toolarge) echo "files too big for the drive format";;
-    namelong) echo "names too long";; xattr) echo "extended attributes";; acl) echo "access lists";; owner) echo "file owners";; *) echo "other errors";;
+    namelong) echo "names too long";; inway) echo "items in the way on the destination";; xattr) echo "extended attributes";; acl) echo "access lists";; owner) echo "file owners";; *) echo "other errors";;
   esac
 }
 
@@ -409,6 +718,11 @@ Run the same command again." \
 "Some file or folder names, or the full path, are longer than the drive format allows." \
 "Shorten the long names (or the folder names above them) on the source, then run the same command again." \
 "Keep folder nesting reasonable; use APFS for the destination." "$ex" ;;
+    *:inway)
+      add_issue PROBLEM DESTINATION "$files couldn't be copied because something with the same name is in the way on the destination" \
+"On the destination, a folder has the same name as a file on the source (or the other way round). smartcopy never deletes anything, so it can't replace it." \
+"Move or rename those items on the destination (they're listed in your private file list), then run the same command again." \
+"Copy into an empty folder, or one that only holds an earlier copy of the same source." "$ex" ;;
     DESTINATION:badname|GENERAL:badname)
       add_issue PROBLEM DESTINATION "$files $have names the destination drive doesn't allow" \
 "Drives formatted as exFAT or FAT don't allow some characters (such as : * ? \" < > | \\) or names that end with a dot or space." \
@@ -462,22 +776,23 @@ If it keeps happening, run Apple Diagnostics (restart holding D, or the power bu
 }
 
 analyse_errors() {
-  local final cats_final cats_all extra
-  final="$LOGDIR/.classified-$STAMP"
-  error_lines "$FINALERR" "$VERIFYLOG" | classify | sort -u > "$final"
+  local final cats_final cats_all extra groups side cat n ex
+  final="$RUNDIR/classified"; groups="$RUNDIR/groups"
+  error_lines "$FINALERR" "$VERIFYLOG" | classify | csort -u > "$final" 2>/dev/null || : > "$final" 2>/dev/null
   if [ -s "$final" ]; then
     { echo "Files affected by problems (side, problem, file):"; echo
       awk -F'\t' '{printf "%-12s %-14s %s\n", $1, $2, $3}' "$final"; echo; } >> "$FAILED"
   fi
-  # Group by side+category, most serious first
-  awk -F'\t' 'BEGIN{ split("nospace readonly io disconnected crashed permission notpermitted toolarge badname namelong verifyfail missing other owner acl xattr vanished",o," "); for(i in o) p[o[i]]=i }
-    { k=$1 FS $2; n[k]++; if ($3!="") ex[k]=ex[k] (ex[k]==""?"":"\034") $3 }
-    END { for (k in n) { split(k,a,FS); print (p[a[2]]?p[a[2]]:50) FS k FS n[k] FS ex[k] } }' "$final" \
-  | sort -n | while IFS=$'\t' read -r _ side cat n ex; do
-      explain "$side" "$cat" "$n" "$([ -n "$ex" ] && echo "__LISTED__")"
-    done
+  # Group by side+category, most serious first (memory: one counter per kind of problem)
+  awk -F'\t' 'BEGIN{ split("nospace readonly io disconnected crashed permission notpermitted toolarge badname namelong inway verifyfail missing other owner acl xattr vanished",o," "); for(i in o) p[o[i]]=i }
+    { k=$1 FS $2; n[k]++; if ($3!="") ex[k]=1 }
+    END { for (k in n) { split(k,a,FS); print (p[a[2]]?p[a[2]]:50) FS k FS n[k] FS (ex[k]?1:0) } }' "$final" 2>/dev/null \
+  | sort -n > "$groups" 2>/dev/null
+  while IFS="$TAB" read -r _ side cat n ex; do
+    explain "$side" "$cat" "$n" "$([ "$ex" = 1 ] && echo "__LISTED__")"
+  done < "$groups"
   if [ "${FDA_MISSING:-0}" -eq 1 ]; then
-    if grep -qE "$(printf '\t')(permission|notpermitted)$(printf '\t')" "$final"; then
+    if grep -qE "$TAB(permission|notpermitted)$TAB" "$final" 2>/dev/null; then
       add_issue PROBLEM GENERAL "Terminal doesn't have Full Disk Access — the likely cause of the blocked files above" \
 "Without it, macOS blocks access to protected locations (Mail, Messages, Safari data, some Library folders and some external drives)." \
 "Open System Settings > Privacy & Security > Full Disk Access, turn on Terminal, quit and reopen Terminal, then run the same command again." \
@@ -490,7 +805,7 @@ analyse_errors() {
   fi
   # Problems that happened on earlier passes but were fixed by retrying
   if [ $(( TOTAL_PASSES - LOOPS )) -gt 0 ]; then
-    cats_final=$(cut -f2 "$final" | sort -u)
+    cats_final=$(cut -f2 "$final" 2>/dev/null | sort -u)
     cats_all=$(error_lines "$ALLERR" | classify | cut -f2 | sort -u)
     extra=""
     for c in $cats_all; do
@@ -502,7 +817,7 @@ analyse_errors() {
   fi
   [ "$SRC_DROPS" -gt 0 ] && explain SOURCE dropped "$SRC_DROPS" ""
   [ "$DST_DROPS" -gt 0 ] && explain DESTINATION dropped "$DST_DROPS" ""
-  rm -f "$final"
+  rm -f "$final" "$groups"
 }
 
 STEP_N=0; STEP_TOTAL=0
@@ -517,23 +832,28 @@ step() {   # step "TITLE" "what happens" "what comes next"
 done_msg() { printf '\r\033[K'; echo "  ✓ $*"; }
 # Show a heartbeat while a background job runs:  heartbeat PID "message"
 heartbeat() {
-  local pid="$1" msg="$2" t0=$SECONDS
+  local pid="$1" msg="$2" t0=$SECONDS el
   while kill -0 "$pid" 2>/dev/null; do
-    printf '\r  %s — %s so far   ' "$msg" "$(fmt_left $(( SECONDS - t0 )) | sed 's/<1 min/under a minute/')"
-    sleep 3
+    el=$(( SECONDS - t0 ))
+    if [ "$el" -ge 2 ]; then
+      if [ "$el" -lt 60 ]; then printf '\r  %s — under a minute so far   ' "$msg"
+      else printf '\r  %s — %s so far   ' "$msg" "$(fmt_left "$el")"; fi
+    fi
+    sleep 1
   done
   printf '\r\033[K'
 }
 
-copied_paths()  {   # "size<TAB>path" for each file copied this run, each file once
-  awk '$4 ~ /^>f/ { line = $0; for (i = 1; i <= 6; i++) sub(/^[^ ]+ +/, "", line); sz[line] = $5; n[line]++ }
-       END { for (p in sz) print sz[p] "\t" n[p] "\t" p }' "$LOG" 2>/dev/null
+# Copy figures for the report, worked out once from the log
+STATS_DONE=0; CS_FILES=0; CS_BYTES=0; CS_TWICE=0
+load_stats() {
+  [ "$STATS_DONE" -eq 1 ] && return 0
+  STATS_DONE=1
+  if logs_here && [ -s "$LOG" ]; then words "$(copy_stats "$LOG")" CS_FILES CS_BYTES CS_TWICE
+  else CS_FILES=$COPIED_FILES; CS_BYTES=$COPIED_BYTES; CS_TWICE=0; fi
 }
-copied_bytes()  { copied_paths | awk -F'\t' '{ s += $1 } END { printf "%.0f", s }'; }
-copied_count()  { copied_paths | wc -l | tr -d ' '; }
-copied_twice()  { copied_paths | awk -F'\t' '$2 > 1' | wc -l | tr -d ' '; }
 copy_bytes_per_sec()  {   # measured over the main copying stage only
-  local b secs="$COPY_SECS"; b=$(copied_bytes)
+  local b secs="$COPY_SECS"; b=$CS_BYTES
   [ "${BATCH_SECS:-0}" -gt 0 ] && { secs=$BATCH_SECS; b=$BATCH_BYTES; }
   [ "$secs" -gt 0 ] && echo $(( ${b:-0} / secs ))
 }
@@ -542,10 +862,10 @@ fmt_dur()             { echo "$(( $1 / 3600 ))h $(( $1 % 3600 / 60 ))m"; }
 # Explain a slow copy: what was measured, and which of the likely causes apply here
 speed_note() {
   local b bps n avg causes="" fix="" ssd
-  b=$(copied_bytes); [ "${b:-0}" -gt 5000000000 ] 2>/dev/null || return 0      # only for copies over 5 GB
+  b=$CS_BYTES; [ "${b:-0}" -gt 5000000000 ] 2>/dev/null || return 0      # only for copies over 5 GB
   bps=$(copy_bytes_per_sec); [ "${bps:-0}" -gt 0 ] || return 0
   [ "$bps" -lt 100000000 ] || return 0                                          # 100 MB/s or more is fine
-  n=$(copied_count); avg=$(( b / (n > 0 ? n : 1) ))
+  n=$CS_FILES; avg=$(( b / (n > 0 ? n : 1) ))
   case "$DST_FS" in exfat|msdos)
     causes="${causes}– The destination is formatted as $FS_LABEL. macOS's support for it is slow with many files and large folders — Carbon Copy Cloner's developers advise avoiding exFAT on a Mac unless Windows needs the drive too.
 "
@@ -579,20 +899,20 @@ ${causes}" "${fix%$'\n'}" ""
 }
 
 render_report() {
-  local np nn copied speed=""
-  analyse_errors
+  local copied speed="" txt saved=1
+  logs_here || saved=0
+  [ "$saved" -eq 1 ] && analyse_errors
+  load_stats
   speed_note
-  local twice; twice=$(copied_twice)
-  if [ "${twice:-0}" -gt 0 ]; then
-    add_issue NOTE DESTINATION "$twice file(s) were copied twice — once in the main copy, then again in the final pass" \
+  if [ "${CS_TWICE:-0}" -gt 0 ]; then
+    add_issue NOTE DESTINATION "$CS_TWICE file(s) were copied twice — once in the main copy, then again in the final pass" \
 "After the main copy, the final pass found these files' dates or sizes on the destination didn't match the source, so it copied them again. The result is correct; it only cost time. On exFAT drives macOS sometimes changes a file's date just after it's written, which causes this." "" \
 "If it happens on every run, reformatting the destination as APFS avoids it (erasing deletes everything on it)."
   fi
   local bps; bps=$(copy_bytes_per_sec)
-  [ "${bps:-0}" -gt 0 ] 2>/dev/null && [ "$(copied_bytes)" -gt 50000000 ] && speed="    Speed: $(( bps / 1000000 )) MB/s"
-  np=$(grep -c '^■' "$ISSUES"); nn=$(grep -c '^■' "$NOTES")
-  copied=$(copied_count)
-  {
+  [ "${bps:-0}" -gt 0 ] 2>/dev/null && [ "${CS_BYTES:-0}" -gt 50000000 ] && speed="    Speed: $(( bps / 1000000 )) MB/s"
+  copied=$CS_FILES
+  txt="$(
     echo "=================================================================="
     echo " FINISHED — REPORT — $(ts)"
     echo "=================================================================="
@@ -603,26 +923,63 @@ render_report() {
       echo " Check:   ${HASH_CHECKED:-0} files via the saved hash list (destination only), ${FULL_CHECKED:-0} compared with the source"
     echo " Time:    $(fmt_dur "$SECONDS")    Passes: $TOTAL_PASSES    Files copied this run: ${copied:-0}${speed}"
     echo
-    if [ "$np" -eq 0 ]; then
+    if [ "$NP" -eq 0 ]; then
       echo "No problems found."; echo
     else
-      echo "PROBLEMS ($np)"; echo "------------------------------------------------------------------"; cat "$ISSUES"
+      echo "PROBLEMS ($NP)"; echo "------------------------------------------------------------------"; printf '%s' "$ISSUES_TXT"
     fi
-    if [ "$nn" -gt 0 ]; then
-      echo "NOTES — for your information ($nn)"; echo "------------------------------------------------------------------"; cat "$NOTES"
+    if [ "$NN" -gt 0 ]; then
+      echo "NOTES — for your information ($NN)"; echo "------------------------------------------------------------------"; printf '%s' "$NOTES_TXT"
     fi
-    if [ -s "$FAILED" ]; then
+    if [ "$saved" -eq 1 ] && [ -s "$FAILED" ]; then
       echo "Private file list: $FAILED"
       echo "  (file names are kept out of this report; that list is in the hidden rsync-logs folder"
       echo "   on the destination drive — to read it:  open -e \"$FAILED\")"
     fi
-    echo "This report: $REPORT"
-    echo "Full logs:   $LOGDIR"
-  } > "$REPORT"
-  echo; cat "$REPORT"
+    if [ "$saved" -eq 1 ]; then
+      echo "This report: $REPORT"
+      echo "Full logs:   $LOGDIR"
+    else
+      echo "This report couldn't be saved: the destination drive isn't connected (nothing is ever saved anywhere else)."
+    fi
+  )"
+  [ "$saved" -eq 1 ] && { printf '%s\n' "$txt" > "$REPORT" 2>/dev/null || saved=0; }
+  echo; printf '%s\n' "$txt"
+}
+
+# The fingerprint list on the destination is usable: current format, same checksum type
+hash_list_ok() { [ -s "$HASHFILE" ] && [ "$(head -1 "$HASHFILE")" = "#smartcopy-hashes v2 algo=$HALGO" ]; }
+# Fold the fingerprints gathered during this run into the list on the destination (once per run)
+save_fingerprints() {
+  local cj="$JPREFIX.sorted" j=() f man="" pl=""
+  logs_here || return 0
+  for f in "$JPREFIX".new-*; do [ -s "$f" ] && j+=("$f"); done
+  [ ${#j[@]} -gt 0 ] && { journal_fold "$cj" "${j[@]}" || return 1; }
+  [ -s "$cj" ] || return 0
+  [ -d "$DST" ] || return 1
+  hash_list_ok && man="$HASHFILE"
+  [ "$PLAN_COMPLETE" -eq 1 ] && [ -s "$PLAN" ] && pl="$PLAN"
+  if manifest_write "$HASHFILE.new.$$" "$HALGO" "$cj" "$man" "$pl" 2>/dev/null && mv -f "$HASHFILE.new.$$" "$HASHFILE"; then
+    rm -f "$cj"
+  else
+    rm -f "$HASHFILE.new.$$"; return 1     # the journal stays on the destination; the next run uses it
+  fi
+}
+
+# Copies that were stopped mid-way: keep the fingerprints of the files they finished. Their output
+# is read once here; the last line is dropped, as it may have been cut off mid-write.
+harvest_unfinished() {
+  local f
+  logs_here || return 0
+  for f in "$RUNDIR"/c.*.log "$PASSLOG"; do
+    [ -s "$f" ] || continue
+    sed '$d' "$f" > "$f.done" 2>/dev/null && harvest_copy "$f.done" "$JOURNAL" >/dev/null
+    cat "$f.done" 2>/dev/null >> "$LOG"; rm -f "$f" "$f.done"
+  done
 }
 
 cleanup() {
+  trap '' INT TERM HUP          # finish tidying up even if Ctrl-C is pressed again
   if [ "$SPOT_WAS_ON" -eq 1 ]; then
     local l other=0
     for l in "$LOGDIR"/locks/*.lock; do     # another copy still writing to this drive? leave it off for now;
@@ -631,27 +988,31 @@ cleanup() {
     done
     [ "$other" -eq 0 ] && mdutil -i on "$DST_VOL" >/dev/null 2>&1 && rm -f "$SPOT_NOTE"
   fi
-  [ "$OWN_LOCK" -eq 1 ] && rm -rf "$LOCK"
+  if [ "$STARTED" -eq 1 ] && [ "$DRYRUN" -eq 0 ]; then
+    harvest_unfinished
+    save_fingerprints || echo "  (Couldn't update the fingerprint list now; the next run will.)"
+  fi
+  [ "$OWN_LOCK" -eq 1 ] && rm -rf "$LOCK" 2>/dev/null
   if [ "$REPORT_ON" -eq 1 ]; then
     render_report
     if [ "$DRYRUN" -eq 0 ]; then
       notify "$(printf '%s' "$RESULT" | sed 's/^[^A-Za-z]* //')"
       # In background mode, open the report so it's waiting for you
-      [ -n "${SMARTCOPY_CHILD:-}" ] && [ -n "${SUDO_USER:-}" ] && \
+      [ -n "${SMARTCOPY_CHILD:-}" ] && [ -n "${SUDO_USER:-}" ] && logs_here && \
         launchctl asuser "$(id -u "$SUDO_USER")" sudo -u "$SUDO_USER" open -e "$REPORT" >/dev/null 2>&1
     fi
   fi
-  if [ "$LOGS_READY" -eq 1 ]; then
-    rm -f "${HASH_NEW:-}" "$PASSLOG" "$PASSERR" "$ALLERR" "$FINALERR" "$ISSUES" "$NOTES" "$LOGDIR/.plan-$STAMP"*
+  if [ "$LOGS_READY" -eq 1 ] && logs_here; then
+    rm -rf "$RUNDIR"
     give_logs_back
   fi
 }
 trap cleanup EXIT
 on_signal() {
   echo
-  if [ "$STARTED" -eq 0 ]; then REPORT_ON=0; echo "Cancelled before the copy started. Nothing was copied."; exit 20; fi
+  if [ "$STARTED" -eq 0 ]; then REPORT_ON=0; echo "Cancelled before the copy started. Nothing was copied."; kill_tree $$; exit 20; fi
   RESULT="⏸ Stopped before finishing — run the same command again; it continues where it stopped."
-  pkill -TERM -P $$ 2>/dev/null      # worker copies
+  kill_tree $$      # worker copies and list scans
   exit 20
 }
 trap on_signal INT TERM HUP
@@ -663,11 +1024,15 @@ wait_for_mounts
 # Re-resolve now that both drives are present (symlinks on the drives themselves)
 SRC="$(resolve "$SRC")"; DST="$(resolve "$DST")"; check_paths
 LOCK="$(lock_path "$DST")"
-LOGDIR="$(logbase_for "$DST")"; init_logs
+LOGDIR="$(logbase_for "$DST")"; set_log_names; init_logs
 running=$(lock_pid "$LOCK") && fatal "A copy to $DST is already running (PID $running)." "" "Stop it first: sudo $0 --stop \"$DST\""
 [ -d "$SRC" ] || fatal "The source folder doesn't exist: $SRC" \
   "The drive is connected, but this folder isn't on it." \
   "Check the spelling and capital letters. Tip: type the command, then drag the folder from Finder into Terminal to paste its exact path." "" SOURCE
+load_dinfo
+DKEY="$(dest_key "$DST")"
+HASHFILE="$DST/.smartcopy-hashes"
+JPREFIX="$LOGDIR/.hashes-$DKEY"; JOURNAL="$JPREFIX.new-$STAMP-$$"   # new fingerprints, kept until merged
 
 if [ "$SRC_VOL" = "$SRC" ]; then SRC_DESC="the whole drive $SRC"; else SRC_DESC="the folder $SRC"; fi
 
@@ -685,6 +1050,7 @@ fi
     "Check the order: the command is  sudo $0 FROM TO
 If you really mean to copy this way round, add --force."
 SRC_ID="$(dinfo "$SRC_VOL" 'Volume UUID'):${SRC#"$SRC_VOL"}"
+VSTATE="$LOGDIR/.verified-$(printf '%s|%s' "$SRC_ID" "$DST" | shasum | cut -c1-12)"
 if [ -f "$SRC/$MARK" ] && [ "$FORCE" -eq 0 ]; then
   fatal "The source looks like the destination — the two may be swapped." \
     "$SRC was itself the destination of an earlier copy (it contains a $MARK marker). Running this way round could overwrite your originals with the copy. Nothing was changed." \
@@ -709,7 +1075,7 @@ case "$DST_FS" in
   apfs|hfs|"")
     META=("$MAC_FLAGS" -8 --numeric-ids)   # archive + hard links + ACLs + xattrs + creation times (when supported)
     case "$DST_VOL" in /Volumes/?*)
-      if diskutil info "$DST_VOL" 2>/dev/null | grep -qE 'Owners: +Disabled'; then
+      if printf '%s\n' "$DI_DST" | grep -qE 'Owners: +Disabled'; then
         if diskutil enableOwnership "$DST_VOL" >/dev/null 2>&1; then
           add_issue NOTE DESTINATION "Turned on ownership for $DST_VOL" \
 "The drive was set to \"Ignore ownership on this volume\", which would have made every copied file belong to an unknown user. It's now on, so owners are kept." "" ""
@@ -729,6 +1095,11 @@ case "$DST_FS" in
     META=(-rt -8)
     add_issue NOTE DESTINATION "The destination's format ($DST_FS) only gets file contents and dates" "" "" "Use APFS for a faithful copy of Mac files." ;;
 esac
+
+# rsync normally lists folders as it goes (memory stays small). With hard links (-H) that mode can
+# hang or fail when an item can't be replaced (seen with rsync 3.2.7), so then it lists everything
+# first, as earlier versions always did.
+NOINC=(); case "${META[0]}" in -a*H*) NOINC=(--no-inc-recursive) ;; esac
 
 # How many files to copy side by side. Parallel copies overlap the per-file waiting that dominates
 # with many files — but on a spinning hard drive they make the head jump around, which is slower.
@@ -763,10 +1134,10 @@ elif [ -f "$DST/$MARK" ]; then
   fi
 fi
 
-# Space check on the first run (a folder is measured; a whole drive uses its usage figure)
-if [ "$first_run" -eq 1 ]; then
-  if [ "$SRC_VOL" = "$SRC" ]; then src_k=$(df -kP "$SRC" | tail -1 | awk '{print $3}')
-  else echo "Measuring the source folder..."; src_k=$(du -sk "$SRC" 2>/dev/null | awk '{print $1}'); fi
+# Space check on the first run. A whole drive uses its usage figure (instant); a folder is measured
+# exactly in step 1 — while listing the files — instead of reading the whole folder twice.
+if [ "$first_run" -eq 1 ] && [ "$SRC_VOL" = "$SRC" ]; then
+  src_k=$(df -kP "$SRC" | tail -1 | awk '{print $3}')
   free_k=$(df -kP "$DST_VOL" | tail -1 | awk '{print $4}')
   if [ "${src_k:-0}" -gt "${free_k:-0}" ] 2>/dev/null; then
     add_issue PROBLEM DESTINATION "The source ($(hk "$src_k")) may not fit in the free space on the destination ($(hk "$free_k"))" \
@@ -774,18 +1145,6 @@ if [ "$first_run" -eq 1 ]; then
 "Free up space on $DST_VOL, use a bigger drive, or copy a smaller folder." \
 "Check sizes before starting; --dry-run shows how much would be copied."
     echo "WARNING: the source ($(hk "$src_k")) may not fit in the destination's free space ($(hk "$free_k"))."
-  fi
-fi
-
-# FAT32 can't hold files of 4 GB or more — find them before wasting hours
-if [ "$DST_FS" = "msdos" ] && [ "$DRYRUN" -eq 0 ]; then
-  echo "Checking for files too big for FAT32..."
-  big=$(find "$SRC" -type f -size +4194303k 2>/dev/null)
-  if [ -n "$big" ]; then
-    add_issue PROBLEM DESTINATION "$(printf '%s\n' "$big" | wc -l | tr -d ' ') file(s) are 4 GB or bigger and can't go on a FAT32 drive" \
-"The destination is FAT32 (MS-DOS), which can't store files of 4 GB or more. These will fail; everything else will copy." \
-"Reformat the destination as APFS (Mac only) or exFAT (Mac + Windows) in Disk Utility > Erase (this deletes everything on it), then run the same command again." \
-"Don't use FAT32 drives for backups." "$(printf '%s\n' "$big" | sed "s|^$SRC/||")"
   fi
 fi
 
@@ -801,7 +1160,7 @@ if [ "$SPEEDTEST" -eq 1 ]; then
   REPORT_ON=0
   T="$DST/.smartcopy-speedtest.$$"
   mkdir -p "$T" 2>/dev/null || fatal "Can't write to $DST for the speed test."
-  trap 'rm -rf "$T"' EXIT
+  trap 'rm -rf "$T"; logs_here && rm -rf "$RUNDIR"' EXIT
   echo "Measuring — this takes about a minute and writes ~600 MB of test files (deleted afterwards)."
   echo
 
@@ -896,11 +1255,13 @@ if ! head -c1 "/Library/Application Support/com.apple.TCC/TCC.db" >/dev/null 2>&
   echo "WARNING: Terminal doesn't seem to have Full Disk Access — protected files may fail to copy."
 fi
 
+# rsync prints one line per item: "%i %l %M %C %n" (change summary, size, date, fingerprint, name).
+# Names in rsync's printed output are escaped, so they're safe to parse; its --log-file isn't.
+FMT='%i %l %M %C %n'
 COMMON=(
-  --human-readable
+  ${NOINC[@]+"${NOINC[@]}"}
   --info=none
-  --no-inc-recursive            # list everything first, so the % and time left are accurate
-  '--log-file-format=%i %l %C %n%L'  # each file's size and fingerprint (hash), for speed figures and the hash list
+  "--out-format=$FMT"           # each file's size, date and fingerprint, for speed figures and the hash list
 )
 case "$DST_FS" in
   msdos|exfat)
@@ -915,18 +1276,18 @@ EXCLUDES=(
   --exclude='/.Spotlight-V100' --exclude='/.fseventsd' --exclude='/.Trashes'
   --exclude='/.DocumentRevisions-V100' --exclude='/.TemporaryItems'
   --exclude='/.MobileBackups' --exclude='/.PKInstallSandboxManager*'
-  --exclude='.rsync-partial' --exclude="/$MARK" --exclude='/.smartcopy-hashes*' --exclude='/.safe-copy-hashes*' --exclude='/.safe-copy-target' --exclude='/rsync-logs/' 
+  --exclude='.rsync-partial' --exclude="/$MARK" --exclude='/.smartcopy-hashes*' --exclude='/.safe-copy-hashes*' --exclude='/.safe-copy-target' --exclude='/rsync-logs/'
 )
 
 # ---------------- --dry-run ----------------
 if [ "$DRYRUN" -eq 1 ]; then
   echo "Dry run — nothing will be written. Working out what would be copied..."
-  dr=$("$RSYNC" "${META[@]}" --dry-run --mkpath --no-inc-recursive --out-format='%i %l' \
+  "$RSYNC" "${META[@]}" ${NOINC[@]+"${NOINC[@]}"} --dry-run --mkpath --out-format='%i %l' \
     "${EXCLUDES[@]}" "$SRC/" "$DST/" 2> "$FINALERR" \
-    | awk '$1 ~ /^>f/ { n++; s += $2 } $1 ~ /^cd/ { d++ } END { printf "%d %.0f %d", n, s, d }')
-  rc=${PIPESTATUS[0]}
-  read -r dn ds dd <<< "$dr"
-  echo "  Would copy $dn files ($(hk $(( ${ds:-0} / 1024 )))) and create $dd folders."
+    | awk '$1 ~ /^>f/ { n++; s += $2 } $1 ~ /^cd/ { d++ } END { printf "%d %.0f %d\n", n, s, d }' > "$RUNDIR/dryrun"
+  st=("${PIPESTATUS[@]}"); rc=${st[0]}; [ "$rc" -eq 0 ] && [ "${st[1]}" -ne 0 ] && rc=1
+  words "$(cat "$RUNDIR/dryrun" 2>/dev/null)" dn ds dd
+  echo "  Would copy ${dn:-0} files ($(hk $(( ${ds:-0} / 1024 )))) and create ${dd:-0} folders."
   [ -s "$FINALERR" ] && echo "  Some files couldn't be read — see the report below."
   RESULT="Dry run only — nothing was copied."
   exit "$rc"
@@ -934,7 +1295,11 @@ fi
 
 # ---------------- Create the destination folder (only now that its drive is confirmed present) ----------------
 wait_for_mounts
-mkdir -p "$DST" 2>/dev/null || fatal "Couldn't create the destination folder $DST" \
+if [ "$DST" = "$DST_VOL" ]; then :
+elif [ "${DST#"$DST_VOL"/}" != "$DST" ]; then           # create it from inside the drive, never on the Mac's drive
+  ( cd "$DST_VOL" 2>/dev/null && on_dst_volume && mkdir -p "./${DST#"$DST_VOL"/}" ) 2>/dev/null
+else mkdir -p "$DST" 2>/dev/null; fi
+[ -d "$DST" ] || fatal "Couldn't create the destination folder $DST" \
   "The drive may be read-only or full, or the folder above it is locked." \
   "Check the drive in Finder, run Disk Utility > First Aid on it, then run the same command again." "" DESTINATION
 probe="$DST/.smartcopy-write-test.$$"
@@ -951,7 +1316,9 @@ if [ -z "$PREV_UNFINISHED" ]; then
   PREV_UNFINISHED=0
   [ -f "$DST/$MARK" ] && ! grep -q '^finished=yes' "$DST/$MARK" && PREV_UNFINISHED=1
 fi
+TIDIED=0; [ -f "$DST/$MARK" ] && grep -q '^partial_tidied=yes' "$DST/$MARK" && TIDIED=1
 printf 'source_id=%s\nsource_name=%s\nstarted=%s\n' "$SRC_ID" "$SRC" "$(ts)" > "$DST/$MARK"
+[ "$TIDIED" -eq 1 ] && echo "partial_tidied=yes" >> "$DST/$MARK"
 mark_finished() { echo "finished=yes" >> "$DST/$MARK" 2>/dev/null; }
 
 # ---------------- --background: re-launch detached so closing Terminal doesn't stop it ----------------
@@ -975,6 +1342,7 @@ if ! mkdir "$LOCK" 2>/dev/null; then
   rm -rf "$LOCK"; mkdir "$LOCK" || fatal "Cannot create the lock $LOCK"     # stale lock from a crash
 fi
 echo $$ > "$LOCK/pid"; echo "$DST_VOL" > "$LOCK/vol"; OWN_LOCK=1
+rm -f "$DST"/.smartcopy-hashes.new.* 2>/dev/null    # left by a run that was cut off while saving fingerprints
 
 # Spotlight indexing a destination drive slows big copies a lot: pause it, restore it after.
 # A note in the log folder remembers this, so a crash or power cut can't leave it off for good.
@@ -989,9 +1357,11 @@ case "$DST_VOL" in /Volumes/?*)
   fi ;;
 esac
 
-if [ "$PREV_UNFINISHED" -eq 1 ] && [ "${WRITE_MODE[0]}" = --inplace ] && [ "$VERIFY_ONLY" -eq 0 ]; then
+# Versions before the exFAT write-in-place mode left .rsync-partial folders behind; tidy them once
+if [ "$PREV_UNFINISHED" -eq 1 ] && [ "${WRITE_MODE[0]}" = --inplace ] && [ "$VERIFY_ONLY" -eq 0 ] && [ "$TIDIED" -eq 0 ]; then
   echo "Tidying up temporary files left by the interrupted run..."
   find "$DST" -type d -name .rsync-partial -prune -exec rm -rf {} + 2>/dev/null
+  echo "partial_tidied=yes" >> "$DST/$MARK"
 fi
 
 caffeinate -ims -w $$ &
@@ -1009,10 +1379,11 @@ errors_in() { grep -E '^rsync( error)?:' "$1" | sort -u; }
 # ============================ Copy loop ============================
 # Returns 0 when a pass finishes, 23 when only persistent errors remain.
 # Keeps going while passes make progress; gives up after MAX_STUCK passes in a row with none.
+PASS_MOVED_TOTAL=0
 copy_loop() {
   local label="$1"; shift
   local extra=("$@")
-  local pass=0 stuck=0 prev_sig="" same=0 sig rc moved used_before used_after wait_s
+  local pass=0 stuck=0 prev_sig="" same=0 sig rc moved used_before used_after wait_s r
   LOOPS=$(( LOOPS + 1 ))
 
   while :; do
@@ -1021,9 +1392,8 @@ copy_loop() {
     [ -d "$SRC" ] || fatal "The source folder is gone: $SRC" \
       "It was moved, renamed or deleted while the copy was running." \
       "Put it back (or fix the path), then run the same command again." "" SOURCE
-    : > "$PASSLOG"
     used_before=$(dst_used_k)
-    echo "=== $label — pass $pass — $(ts) ===" >> "$LOG"
+    echo "=== $label — pass $pass — $(ts) ===" 2>/dev/null >> "$LOG"
     [ "$pass" -gt 1 ] && echo "  Trying again (attempt $pass)..."
     # Copy whole files (fastest). Only when a previous attempt was cut off, and the destination keeps
     # half-copied files aside (APFS/HFS), compare against them so big files resume instead of restarting.
@@ -1032,37 +1402,43 @@ copy_loop() {
       delta=--no-whole-file
     fi
     t0=$SECONDS
-    "$RSYNC" "${META[@]}" "${COMMON[@]}" "${CSUM[@]}" "${WRITE_MODE[@]}" "$delta" ${extra[@]+"${extra[@]}"} "${EXCLUDES[@]}" \
-      --log-file="$PASSLOG" "$SRC/" "$DST/" > /dev/null 2> "$PASSERR" &
+    in_dst "$RSYNC" "${META[@]}" "${COMMON[@]}" "${CSUM[@]}" "${WRITE_MODE[@]}" "$delta" ${extra[@]+"${extra[@]}"} "${EXCLUDES[@]}" \
+      "$SRC/" ./ > "$PASSLOG" 2> "$PASSERR" &
     local rpid=$!
     heartbeat "$rpid" "$label: going through all files on both drives"
     wait "$rpid"; rc=$?
     COPY_SECS=$(( COPY_SECS + SECONDS - t0 ))
-    sleep 1                                   # let the error capture finish writing
-    cat "$PASSLOG" >> "$LOG"
-    cat "$PASSERR" >> "$ALLERR"; cp "$PASSERR" "$FINALERR"
+    if [ "$rc" -eq 98 ] || ! drives_here; then  # a drive went away (even before rsync could start): wait, try again
+      TOTAL_PASSES=$(( TOTAL_PASSES - 1 )); pass=$(( pass - 1 )); continue
+    fi
+    r=$(harvest_copy "$PASSLOG" "$JOURNAL"); [ -n "$r" ] || r="0 0"   # fingerprints of what this pass copied
+    COPIED_FILES=$(( COPIED_FILES + ${r#* } )); COPIED_BYTES=$(( COPIED_BYTES + ${r% *} ))
+    cat "$PASSLOG" 2>/dev/null >> "$LOG"
+    cat "$PASSERR" 2>/dev/null >> "$ALLERR"; cp "$PASSERR" "$FINALERR" 2>/dev/null
     used_after=$(dst_used_k)
+    moved=$(grep -cE '^(>f|cd|cL|hf)' "$PASSLOG" 2>/dev/null); moved=${moved:-0}
+    : > "$PASSLOG" 2>/dev/null                # read once; nothing left for harvest_unfinished
+    PASS_MOVED_TOTAL=$(( PASS_MOVED_TOTAL + moved ))
 
     case $rc in
-      0)  echo "$label: pass finished cleanly." >> "$LOG"; return 0 ;;
-      24) echo "$label: finished (some source files changed during the copy)." >> "$LOG"; return 0 ;;
+      0)  echo "$label: pass finished cleanly." 2>/dev/null >> "$LOG"; return 0 ;;
+      24) echo "$label: finished (some source files changed during the copy)." 2>/dev/null >> "$LOG"; return 0 ;;
       20) RESULT="⏸ Stopped before finishing — run the same command again to resume."; exit 20 ;;
       1|2|4) fatal "rsync couldn't start (error code $rc)." \
                "This is a setup problem that retrying won't fix — usually an option this rsync doesn't support." \
                "Update rsync: brew upgrade rsync, then run the same command again.
 The exact message is at the end of $LOG" ;;
     esac
-    echo "$label: some files had problems (rsync code $rc)." >> "$LOG"
+    echo "$label: some files had problems (rsync code $rc)." 2>/dev/null >> "$LOG"
     echo "  Some files had problems — they'll be explained in the report at the end."
 
     # Problems that retrying cannot fix: stop now; the report explains them
-    if grep -qE 'No space left on device|Read-only file system' "$PASSERR"; then
+    if grep -qE 'No space left on device|Read-only file system' "$PASSERR" 2>/dev/null; then
       RESULT="❌ Stopped — the destination can't take any more data. See below."
       exit 1
     fi
 
     # Progress = files completed, or the destination grew (a huge file cut off part-way)
-    moved=$(grep -cE '\] (>f|cd|cL|hf)' "$PASSLOG")
     if [ "$moved" -gt 0 ] || { [ -n "$used_after" ] && [ "$used_after" != "$used_before" ]; }; then
       stuck=0
     else
@@ -1070,7 +1446,7 @@ The exact message is at the end of $LOG" ;;
     fi
 
     # Same files failing the same way, with nothing else left to copy = permanent problems
-    sig=$(errors_in "$PASSERR" | shasum | cut -c1-40)
+    sig=$(errors_in "$PASSERR" 2>/dev/null | shasum | cut -c1-40)
     if [ "$sig" = "$prev_sig" ]; then same=$(( same + 1 )); else same=0; fi
     if [ "$rc" -eq 23 ] && [ "$same" -ge 1 ] && { [ "$moved" -eq 0 ] || [ "$same" -ge 2 ]; }; then
       echo "  The same files keep failing, so retrying won't help. Everything else is copied." | tee -a "$LOG"
@@ -1096,14 +1472,26 @@ fmt_left() {
   elif [ "$x" -lt 3570 ]; then echo "$(( (x + 30) / 60 )) min"
   else x=$(( x + 30 )); echo "$(( x / 3600 ))h $(( x % 3600 / 60 ))m"; fi
 }
-clock_at() {   # clock time N seconds from now; adds the weekday when it isn't today
-  local e fmt="+%H:%M"
-  e=$(( $(date +%s) + $1 ))
-  if [ "$(uname)" = Darwin ]; then
-    [ "$(date +%j)" != "$(date -r "$e" +%j)" ] && fmt="+%a %H:%M"; date -r "$e" "$fmt"
-  else
-    [ "$(date +%j)" != "$(date -d "@$e" +%j)" ] && fmt="+%a %H:%M"; date -d "@$e" "$fmt"
+fmt_left_v() {   # fmt_left_v VAR SECONDS (no subprocess)
+  local x="$2"
+  if [ "$x" -lt 60 ]; then printf -v "$1" '%s' "<1 min"
+  elif [ "$x" -lt 3570 ]; then printf -v "$1" '%d min' $(( (x + 30) / 60 ))
+  else x=$(( x + 30 )); printf -v "$1" '%dh %dm' $(( x / 3600 )) $(( x % 3600 / 60 )); fi
+}
+EPOCH0=$(( $(date +%s) - SECONDS ))    # wall clock = EPOCH0 + SECONDS, without calling date
+CLOCK_KEY=""; CLOCK_TXT=""
+clock_at_v() {   # clock_at_v VAR SECONDS: clock time N seconds from now; adds the weekday when it isn't today
+  local e fmt="+%H:%M" key
+  e=$(( EPOCH0 + SECONDS + $2 )); key=$(( e / 60 ))
+  if [ "$key" != "$CLOCK_KEY" ]; then           # only ask date when the shown minute changes
+    if [ "$(uname)" = Darwin ]; then
+      [ "$(date +%j)" != "$(date -r "$e" +%j)" ] && fmt="+%a %H:%M"; CLOCK_TXT=$(date -r "$e" "$fmt")
+    else
+      [ "$(date +%j)" != "$(date -d "@$e" +%j)" ] && fmt="+%a %H:%M"; CLOCK_TXT=$(date -d "@$e" "$fmt")
+    fi
+    CLOCK_KEY=$key
   fi
+  printf -v "$1" '%s' "$CLOCK_TXT"
 }
 
 # Time-left estimator — built to be steady:
@@ -1128,46 +1516,45 @@ est_add() {    # est_add DONE_BYTES DONE_FILES
   EST_RATE=$(( (r_all + r_win) / 2 )); [ "$EST_RATE" -gt 0 ] || EST_RATE=1
   EST_N=$(( EST_N + 1 ))
 }
-est_secs() {   # est_secs BYTES FILES [per-file factor]
-  [ "$EST_RATE" -gt 0 ] || { echo 0; return; }
-  awk -v b="$1" -v f="$2" -v k="${3:-1}" -v pf="$PER_FILE" -v r="$EST_RATE" 'BEGIN { printf "%.0f", (b + f*pf*k) / r }'
-}
 # Smooth the finish time: move 1/6 of the way towards the new estimate each update (~30 s settle),
 # except right after the first estimate, and never show a time already in the past.
-est_finish() {  # est_finish SECONDS_LEFT -> prints smoothed seconds left
-  local now tgt; now=$(date +%s); tgt=$(( now + $1 ))
+est_finish() {  # est_finish SECONDS_LEFT -> smoothed seconds left in EST_LEFT
+  local now tgt; now=$(( EPOCH0 + SECONDS )); tgt=$(( now + $1 ))
   if [ "$EST_FIN" -eq 0 ]; then EST_FIN=$tgt; else EST_FIN=$(( EST_FIN + (tgt - EST_FIN) / 6 )); fi
   [ "$EST_FIN" -lt "$now" ] && EST_FIN=$now
-  echo $(( EST_FIN - now ))
+  EST_LEFT=$(( EST_FIN - now ))
 }
 
-# One clearly labelled status line, refreshed every few seconds
+# One clearly labelled status line, refreshed every second (no subprocesses except a rare date/tput)
+COLS=0; COLS_AT=-100
 progress_line() {   # progress_line LABEL DONE_BYTES TOTAL_BYTES DONE_FILES TOTAL_FILES
-  local label="$1" db="$2" tb="$3" df="$4" tf="$5" pct el bps left="estimating…" when="" secs vsecs
+  local label="$1" db="$2" tb="$3" df="$4" tf="$5" pct el bps left="estimating…" when="" secs vsecs f1 f2 h1 h2
   el=$(( SECONDS - PHASE_T0 )); [ "$el" -gt 0 ] || el=1
   bps=$(( (db - ${PHASE_B0:-0}) / el )); [ "$bps" -ge 0 ] || bps=0
   pct=100; [ "$tb" -gt 0 ] && pct=$(( db * 100 / tb ))
   if [ "${TUNING:-0}" -eq 1 ]; then
     left="measuring speed (first ~5 min)"
   elif [ "$EST_RATE" -gt 0 ]; then
-    secs=$(est_secs $(( tb > db ? tb - db : 0 )) $(( tf > df ? tf - df : 0 )))
+    secs=$(( EST_RATE > 0 ? ( (tb > db ? tb - db : 0) + (tf > df ? tf - df : 0) * PER_FILE ) / EST_RATE : 0 ))
     if [ "$label" = "Copying" ] && [ "$VERIFY" != "0" ]; then
-      vsecs=$(est_secs "$ALL_BYTES" "$ALL_FILES" 0.3)       # rough: checking reads, it doesn't create files
-      secs=$(est_finish $(( secs + vsecs )))
-      left="$(fmt_left "$secs") (incl. ~$(fmt_left "$vsecs") checking)"
+      vsecs=$(( (ALL_BYTES * 10 + ALL_FILES * PER_FILE * 3) / (EST_RATE * 10) ))   # rough: checking reads, it doesn't create files
+      est_finish $(( secs + vsecs )); secs=$EST_LEFT
+      fmt_left_v f1 "$secs"; fmt_left_v f2 "$vsecs"; left="$f1 (incl. ~$f2 checking)"
     else
-      secs=$(est_finish "$secs"); left="$(fmt_left "$secs")"
+      est_finish "$secs"; secs=$EST_LEFT; fmt_left_v left "$secs"
     fi
-    when=$(clock_at "$secs")
+    clock_at_v when "$secs"
   fi
   # Build the line from the most important parts outward, dropping the least important ones
   # when the window is narrow — the time left and the finish time are never cut off.
-  local line cols head tail fl=$(( tf > df ? tf - df : 0 )) part
+  local line head tail fl=$(( tf > df ? tf - df : 0 )) part
   local -a extras
-  head=$(printf '%s %d%%' "$label" "$pct")
+  head="$label $pct%"
   tail=" · TIME LEFT: $left${when:+ · FINISHES ≈ $when}"
-  extras=( " · $(hk $(( db / 1024 ))) of $(hk $(( tb / 1024 )))" " · $fl files left" " · $(( bps / 1000000 )) MB/s" )
-  cols=$(tput cols 2>/dev/null); [ "${cols:-0}" -ge 40 ] || cols=200
+  hk_v h1 $(( db / 1024 )); hk_v h2 $(( tb / 1024 ))
+  extras=( " · $h1 of $h2" " · $fl files left" " · $(( bps / 1000000 )) MB/s" )
+  if [ $(( SECONDS - COLS_AT )) -ge 15 ]; then COLS=$(tput cols 2>/dev/null); COLS_AT=$SECONDS; fi
+  local cols="$COLS"; [ "${cols:-0}" -ge 40 ] 2>/dev/null || cols=200
   line="$head"
   for part in "${extras[@]}"; do
     [ $(( ${#line} + ${#part} + ${#tail} )) -lt "$cols" ] && line="$line$part"
@@ -1181,80 +1568,128 @@ progress_line() {   # progress_line LABEL DONE_BYTES TOTAL_BYTES DONE_FILES TOTA
   if [ $(( SECONDS - LAST_NL )) -ge 600 ]; then echo; LAST_NL=$SECONDS; fi     # keep a history line every 10 min
 }
 
-# Scan both drives once: every file in the source (for checking) and which still need copying
+# Scan both drives once: every file in the source (for checking), which still need copying, and the
+# folders and links (for the final pass). Lists are written to the destination drive and sorted.
 plan_scan() {
-  PLAN_ALL="$LOGDIR/.plan-$STAMP.all"; PLAN_TODO="$LOGDIR/.plan-$STAMP.todo"
-  wait_for_mounts
-  ( "$RSYNC" "${META[@]}" --dry-run --no-inc-recursive -ii --out-format='%i %l %n' "${EXCLUDES[@]}" \
-      "$SRC/" "$DST/" 2>/dev/null \
-    | awk -v all="$PLAN_ALL" -v todo="$PLAN_TODO" '
-        substr($1, 2, 1) == "f" && $1 ~ /^[.>]/ {
-          i1 = index($0, " "); r = substr($0, i1 + 1); sub(/^ +/, "", r); i2 = index(r, " ")
-          line = substr(r, 1, i2 - 1) "\t" substr(r, i2 + 1)
-          print line > all; if ($1 ~ /^>/) print line > todo }' ) &
-  local scan_pid=$!
-  heartbeat "$scan_pid" "Listing every file on both drives"
-  wait "$scan_pid"     # wait for the scan only (a bare "wait" would also wait for caffeinate, forever)
-  : >> "$PLAN_ALL"; : >> "$PLAN_TODO"
-  ALL_FILES=$(wc -l < "$PLAN_ALL" | tr -d ' ');   ALL_BYTES=$(awk -F'\t' '{ s += $1 } END { printf "%.0f", s }' "$PLAN_ALL")
-  TODO_FILES=$(wc -l < "$PLAN_TODO" | tr -d ' '); TODO_BYTES=$(awk -F'\t' '{ s += $1 } END { printf "%.0f", s }' "$PLAN_TODO")
+  local raw="$RUNDIR/plan.raw" err="$RUNDIR/scan.err" tries=0 rc pid
+  PLAN="$RUNDIR/plan"; PLAN_OTHER="$RUNDIR/plan.other"; PLAN_SUM="$RUNDIR/plan.sum"
+  while :; do
+    wait_for_mounts
+    ( "$RSYNC" "${META[@]}" ${NOINC[@]+"${NOINC[@]}"} --dry-run -ii --out-format='%i %l %M %n' "${EXCLUDES[@]}" "$SRC/" "$DST/" 2> "$err" \
+        | scan_parse "$raw" "$PLAN_OTHER" "$PLAN_SUM"
+      st=("${PIPESTATUS[@]}")
+      [ "${st[1]}" -eq 0 ] || exit 199          # couldn't write the list on the destination
+      exit "${st[0]}" ) &
+    pid=$!
+    heartbeat "$pid" "Listing every file on both drives"
+    wait "$pid"; rc=$?   # wait for the scan only (a bare "wait" would also wait for caffeinate, forever)
+    cat "$err" 2>/dev/null >> "$ALLERR"
+    case $rc in
+      0|24) PLAN_COMPLETE=1; break ;;
+      23)   PLAN_COMPLETE=0; break ;;            # some items couldn't be read; the copy reports them
+    esac
+    drives_here || { tries=$(( tries - 1 )); rc=0; }   # a drive went away: wait for it, don't count the try
+    case $rc in
+      20)   RESULT="⏸ Stopped before finishing — run the same command again to resume."; exit 20 ;;
+      1|2|4) fatal "rsync couldn't start (error code $rc)." \
+               "This is a setup problem that retrying won't fix — usually an option this rsync doesn't support." \
+               "Update rsync: brew upgrade rsync, then run the same command again." ;;
+    esac
+    tries=$(( tries + 1 ))
+    if [ "$tries" -ge 4 ] && is_mounted "$SRC_VOL" && is_mounted "$DST_VOL"; then
+      fatal "Couldn't list the files on the drives (error code $rc)." \
+        "Listing the files was cut off several times in a row." \
+        "Check both drives in Disk Utility > First Aid, then run the same command again."
+    fi
+    echo "  Listing the files was cut off — trying again..."
+    sleep 15
+  done
+  csort -k1,1 "$raw" > "$PLAN" || { wait_for_mounts; csort -k1,1 "$raw" > "$PLAN"; } || \
+    fatal "Couldn't write the file list on the destination drive." "The drive may be full or was disconnected." \
+      "Free some space or reconnect the drive, then run the same command again." "" DESTINATION
+  rm -f "$raw"
+  words "$(cat "$PLAN_SUM" 2>/dev/null)" ALL_FILES ALL_BYTES TODO_FILES TODO_BYTES N_OTHER N_HLINKS
   done_msg "Found $ALL_FILES files ($(hk $(( ALL_BYTES / 1024 )))) on the source."
 }
 
-# Cut a plan (size<TAB>path, in folder order) into batches of ~1–8 GB / up to 5000 files.
-# Writes PREFIX.0001 … and PREFIX.sizes ("batch bytes files"); loads sizes into BSIZE/BCOUNT.
-make_batches() {
-  local plan="$1" pre="$2" total target b sz cnt
-  total=$(awk -F'\t' '{ s += $1 } END { printf "%.0f", s }' "$plan")
-  target=$(( total / 64 ))
-  [ "$target" -lt 1073741824 ] && target=1073741824; [ "$target" -gt 8589934592 ] && target=8589934592
-  awk -F'\t' -v pre="$pre" -v tgt="$target" '
-    BEGIN { b = 1; acc = 0; n = 0; f = sprintf("%s.%04d", pre, b) }
-    { if ((acc >= tgt || n >= 5000) && n > 0) { close(f); b++; acc = 0; n = 0; f = sprintf("%s.%04d", pre, b) }
-      print $2 > f; acc += $1; n++; sz[b] += $1; cnt[b]++ }
-    END { close(f); for (i = 1; i <= b; i++) if (cnt[i] > 0) printf "%d %.0f %d\n", i, sz[i], cnt[i] > (pre ".sizes") }' "$plan"
-  NB=0; BSIZE=(); BCOUNT=()
-  while read -r b sz cnt; do BSIZE[b]=$sz; BCOUNT[b]=$cnt; NB=$b; done < "$pre.sizes"
+# Checks that need the file list: does it fit, and (FAT32) files of 4 GB or more
+post_scan_checks() {
+  local free_k big
+  if [ "$first_run" -eq 1 ] && [ "$SRC_VOL" != "$SRC" ] && [ "$VERIFY_ONLY" -eq 0 ]; then
+    free_k=$(df -kP "$DST_VOL" | tail -1 | awk '{print $4}')
+    if [ $(( TODO_BYTES / 1024 )) -gt "${free_k:-0}" ] 2>/dev/null; then
+      add_issue PROBLEM DESTINATION "The files to copy ($(hk $(( TODO_BYTES / 1024 )))) may not fit in the free space on the destination ($(hk "$free_k"))" \
+"The destination will fill up before the copy finishes." \
+"Free up space on $DST_VOL, use a bigger drive, or copy a smaller folder." \
+"Check sizes before starting; --dry-run shows how much would be copied."
+      echo "WARNING: the files to copy ($(hk $(( TODO_BYTES / 1024 )))) may not fit in the destination's free space ($(hk "$free_k"))."
+    fi
+  fi
+  # FAT32 can't hold files of 4 GB or more — find them before wasting hours
+  if [ "$DST_FS" = "msdos" ] && [ "$VERIFY_ONLY" -eq 0 ]; then
+    big=$(LC_ALL=C awk -F'\t' '$4 == "T" && $2 > 4294967295 { n++; print $1 > f } END { print n+0 }' f="$RUNDIR/big" "$PLAN")
+    if [ "${big:-0}" -gt 0 ]; then
+      add_issue PROBLEM DESTINATION "$big file(s) are 4 GB or bigger and can't go on a FAT32 drive" \
+"The destination is FAT32 (MS-DOS), which can't store files of 4 GB or more. These will fail; everything else will copy." \
+"Reformat the destination as APFS (Mac only) or exFAT (Mac + Windows) in Disk Utility > Erase (this deletes everything on it), then run the same command again." \
+"Don't use FAT32 drives for backups." "__LISTED__"
+      { echo "== $big file(s) are 4 GB or bigger and can't go on a FAT32 drive"; cat "$RUNDIR/big"; echo; } >> "$FAILED"
+    fi
+  fi
 }
 
 # Keep K rsyncs busy, one batch each. With AUTO_TUNE on big jobs it measures 1-at-a-time against
-# 4-at-a-time for ~2 minutes each, then carries on with whichever was faster.
-run_batches() {    # run_batches copy|verify PREFIX TOTAL_BYTES TOTAL_FILES
+# 4-at-a-time for ~2 minutes each, then carries on with whichever was faster. Each batch's output is
+# read once, when it finishes; the progress line only reads the batches still running.
+run_batches() {    # run_batches copy|verify|hash PREFIX TOTAL_BYTES TOTAL_FILES
   local mode="$1" pre="$2" tb="$3" tf="$4" k="$JOBS" next=1 slot pid rc b f running done_b done_f r
-  local tkv cal=0 stage=0 el work t1 w1 m1 t2 w2 m2 t3 w3 m3 ra rb label="Copying" done_b_tune=0
-  local -a PIDS BATCH
+  local tkv cal=0 stage=0 el work t1 w1 m1 t2 w2 m2 t3 w3 m3 ra rb label="Copying" done_b_tune=0 fin_b=0 fin_f=0 nd
+  local -a PIDS BATCH live
   [ "$mode" = verify ] && label="Checking"
   [ "$mode" = hash ] && label="Checking"
+  tb="${tb%%.*}"
   if [ "$AUTO_TUNE" -eq 1 ] && [ "$tb" -ge 21474836480 ] && [ "$tf" -ge 2000 ] && [ "$NB" -ge 6 ]; then
     tkv="TUNED_$mode"
     if [ -n "${!tkv:-}" ]; then k=${!tkv}; else cal=1; k=1; fi
   fi
-  RETRY_BATCHES=""; HAD23=0; B_DONE_BYTES=0; B_DONE_FILES=0
+  RETRY_BATCHES=""; HAD23=0; BATCH_FAILED=0
   PHASE_T0=$SECONDS; PHASE_B0=0; LAST_NL=$SECONDS; est_reset
   while :; do
-    running=0
+    running=0; live=()
     for slot in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
       pid="${PIDS[slot]:-}"; [ -n "$pid" ] || continue
-      if kill -0 "$pid" 2>/dev/null; then running=$(( running + 1 )); continue; fi
-      wait "$pid"; rc=$?; b="${BATCH[slot]}"; PIDS[slot]=""
-      B_DONE_BYTES=$(( B_DONE_BYTES + BSIZE[b] )); B_DONE_FILES=$(( B_DONE_FILES + BCOUNT[b] ))
-      case $rc in 0|24) ;; 23) HAD23=1 ;; *) RETRY_BATCHES="$RETRY_BATCHES $b" ;; esac
-      # A checked batch with no differences is remembered, so an interrupted check can resume
-      f=$(printf '%s.%04d' "$pre" "$b")
-      if [ "$mode" = verify ]; then
-        vharvest < "$f.out" >> "$HASH_NEW"          # matching files: save their fingerprints
-        { [ "$rc" -eq 0 ] || [ "$rc" -eq 24 ]; } && [ -z "$(vdiffs < "$f.out")" ] && cat "$f" >> "$VSTATE"
-      elif [ "$mode" = hash ]; then
-        hcompare "$f" "$f.out" > "$f.diff"
-        { [ "$rc" -eq 0 ] || [ "$rc" -eq 24 ]; } && [ ! -s "$f.diff" ] && cat "$f" >> "$VSTATE"
+      printf -v f '%s.%04d' "$pre" "${BATCH[slot]}"
+      if kill -0 "$pid" 2>/dev/null; then
+        running=$(( running + 1 ))
+        if [ "$mode" = copy ]; then live+=("$f.log"); else live+=("$f.out"); fi
+        continue
       fi
+      wait "$pid"; rc=$?; b="${BATCH[slot]}"; PIDS[slot]=""
+      case $rc in 0|24) ;; 23) HAD23=1; BATCH_FAILED=1 ;; *) RETRY_BATCHES="$RETRY_BATCHES $b"; BATCH_FAILED=1 ;; esac
+      if [ "$mode" = copy ]; then
+        r=$(harvest_copy "$f.log" "$JOURNAL"); [ -n "$r" ] || r="0 0"   # fingerprints of the copied files
+        COPIED_FILES=$(( COPIED_FILES + ${r#* } )); COPIED_BYTES=$(( COPIED_BYTES + ${r% *} ))
+        cat "$f.log" 2>/dev/null >> "$LOG"; cat "$f.err" 2>/dev/null >> "$ALLERR"
+      elif [ "$mode" = verify ]; then
+        r=$(finish_check "$f.out" "$JOURNAL" "$VERIFYLOG"); cat "$f.err" 2>/dev/null >> "$VERIFYLOG"
+      else
+        r=$(finish_hash "$f.rec" "$f.out" "$VERIFYLOG"); cat "$f.err" 2>/dev/null >> "$VERIFYLOG"
+      fi
+      [ "$mode" = copy ] || [ -n "$r" ] || r="0 0 1"
+      if [ "$mode" != copy ]; then
+        # A checked batch with no differences is remembered, so an interrupted check can resume
+        nd=${r##* }; r=${r% *}
+        { [ "$rc" -eq 0 ] || [ "$rc" -eq 24 ]; } && [ "$nd" -eq 0 ] && cut -f1-3 "$f.rec" 2>/dev/null >> "$VSTATE"
+      fi
+      fin_b=$(( fin_b + ${r% *} )); fin_f=$(( fin_f + ${r#* } ))
+      rm -f "$f.log" "$f.err" "$f.out"
+      case $rc in 0|23|24) rm -f "$f" "$f.rec" ;; esac          # failed batches keep their lists for the retry
     done
-    if [ "$mode" = copy ]; then
-      r=$(cat "$pre".*.log 2>/dev/null | awk '$4 ~ /^>f/ { s += $5; n++ } END { printf "%.0f %d", s, n }')
-      done_b=${r% *}; done_f=${r#* }
-    else
-      r=$(cat "$pre".*.out 2>/dev/null | awk 'substr($1,2,1) == "f" && $2 ~ /^[0-9]+$/ { s += $2; n++ } END { printf "%.0f %d", s, n }')
-      done_b=${r% *}; done_f=${r#* }
+    done_b=$fin_b; done_f=$fin_f
+    if [ "$running" -gt 0 ]; then
+      if [ "$mode" = copy ]; then r=$(progress_count copy "${live[@]}"); else r=$(progress_count check "${live[@]}"); fi
+      [ -n "$r" ] || r="0 0"
+      done_b=$(( done_b + ${r% *} )); done_f=$(( done_f + ${r#* } ))
     fi
     est_add "$done_b" "$done_f"
     if [ "$cal" -eq 1 ]; then          # auto-tuning: compare 1 vs 4 copies at a time
@@ -1279,17 +1714,17 @@ run_batches() {    # run_batches copy|verify PREFIX TOTAL_BYTES TOTAL_FILES
     while [ "$running" -lt "$k" ] && [ "$next" -le "$NB" ]; do
       if ! is_mounted "$SRC_VOL" || ! is_mounted "$DST_VOL"; then printf '\n'; wait_for_mounts; fi
       for slot in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do [ -z "${PIDS[slot]:-}" ] && break; done
-      b=$next; f=$(printf '%s.%04d' "$pre" "$b")
+      b=$next; printf -v f '%s.%04d' "$pre" "$b"
       if [ "$mode" = copy ]; then
-        "$RSYNC" "${META[@]}" -r '--log-file-format=%i %l %C %n%L' "${CSUM[@]}" "${WRITE_MODE[@]}" "$COPY_DELTA" \
-          "${EXCLUDES[@]}" --files-from="$f" --log-file="$f.log" "$SRC/" "$DST/" > /dev/null 2> "$f.err" &
+        in_dst "$RSYNC" "${META[@]}" -r "--out-format=$FMT" "${CSUM[@]}" "${WRITE_MODE[@]}" "$COPY_DELTA" \
+          "${EXCLUDES[@]}" --from0 --files-from="$f" "$SRC/" ./ > "$f.log" 2> "$f.err" &
       elif [ "$mode" = verify ]; then
-        "$RSYNC" "${META[@]}" -r --checksum "${CSUM[@]}" --dry-run -ii --out-format='%i %l %C %n' \
-          "${EXCLUDES[@]}" --files-from="$f" "$SRC/" "$DST/" > "$f.out" 2>&1 &
+        in_dst "$RSYNC" "${META[@]}" -r --checksum "${CSUM[@]}" --dry-run -ii "--out-format=$FMT" \
+          "${EXCLUDES[@]}" --from0 --files-from="$f" "$SRC/" ./ > "$f.out" 2> "$f.err" &
       elif [ "$mode" = hash ]; then
         # Destination only: list its files into an empty folder; nothing is written, only hashes are read
-        "$RSYNC" -r -8 --checksum "${CSUM[@]}" --dry-run -i --out-format='%i %l %C %n' \
-          --files-from="$f" "$DST/" "$EMPTY_DIR/" > "$f.out" 2>&1 &
+        in_dst "$RSYNC" -r -8 --checksum "${CSUM[@]}" --dry-run -i "--out-format=$FMT" \
+          --from0 --files-from="$f" ./ "$EMPTY_DIR/" > "$f.out" 2> "$f.err" &
       fi
       PIDS[slot]=$!; BATCH[slot]=$b; next=$(( next + 1 )); running=$(( running + 1 ))
     done
@@ -1302,140 +1737,94 @@ run_batches() {    # run_batches copy|verify PREFIX TOTAL_BYTES TOTAL_FILES
 
 # Fast copy of everything the scan found missing or changed
 batch_copy() {
-  local pre="$LOGDIR/.plan-$STAMP.c" t0
+  local pre="$RUNDIR/c" t0
   [ "$TODO_FILES" -gt 0 ] || return 0
   COPY_DELTA=--whole-file
   [ "${WRITE_MODE[0]}" != --inplace ] && [ "$PREV_UNFINISHED" -eq 1 ] && COPY_DELTA=--no-whole-file
-  make_batches "$PLAN_TODO" "$pre"
+  make_batches "$PLAN" "$pre" copy "$TODO_BYTES" || fatal "Couldn't write the file list on the destination drive." \
+    "The drive may be full or was disconnected." "Free some space or reconnect the drive, then run the same command again." "" DESTINATION
+  local b0=$COPIED_BYTES
   t0=$SECONDS
   run_batches copy "$pre" "$TODO_BYTES" "$TODO_FILES"
   COPY_SECS=$(( COPY_SECS + SECONDS - t0 )); BATCH_SECS=$(( SECONDS - t0 )); [ "$BATCH_SECS" -gt 0 ] || BATCH_SECS=1
-  BATCH_BYTES=$(cat "$pre".*.log 2>/dev/null | awk '$4 ~ /^>f/ { s += $5 } END { printf "%.0f", s }')
-  cat "$pre".*.log >> "$LOG" 2>/dev/null; cat "$pre".*.err >> "$ALLERR" 2>/dev/null
-  [ -n "$RETRY_BATCHES" ] && PREV_UNFINISHED=1     # half-written files possible: the final pass resumes them
+  BATCH_BYTES=$(( COPIED_BYTES - b0 ))
+  [ "$BATCH_FAILED" -eq 1 ] && PREV_UNFINISHED=1     # half-written files possible: the final pass resumes them
+  COPY_BATCH_FAILED=$BATCH_FAILED
   rm -f "$pre".*
 }
 
 # ---------------- Hash list (fingerprints of the source files, kept on the destination) ----------------
-HALGO="${CSUM[0]:-}"; HALGO="${HALGO#--checksum-choice=}"; HALGO="${HALGO:-default}"
-hash_list_ok() { [ -s "$HASHFILE" ] && head -1 "$HASHFILE" | grep -q "algo=$HALGO\$"; }
-# From a copy log: fingerprints of files that were copied ("hash<TAB>size<TAB>path")
-charvest() {
-  awk '$4 ~ /^>f/ && length($6) == 32 && $6 ~ /^[0-9a-f]+$/ {
-    line = $0; for (i = 1; i <= 6; i++) sub(/^[^ ]+ +/, "", line)
-    print $6 "\t" $5 "\t" line }' "$@"
-}
-# From full-check output: fingerprints of files that matched the destination exactly
-vharvest() {
-  awk '{ i = substr($0, 1, 11)
-    if (i ~ /^[.h]f/ && substr(i, 3) ~ /^ *$/ && substr($0, 12, 1) == " ") {
-      rest = substr($0, 13); sz = rest; sub(/ .*/, "", sz); sub(/^[0-9]+ /, "", rest)
-      h = substr(rest, 1, 32); p = substr(rest, 34)
-      if (h ~ /^[0-9a-f]+$/ && length(h) == 32) print h "\t" sz "\t" p } }'
-}
-# Merge new fingerprints (file of "hash<TAB>size<TAB>path") into the list on the destination
-hash_merge() {
-  local new="$1" tmp="$HASHFILE.new.$$"
-  [ -s "$new" ] || return 0
-  hash_list_ok || : > "$HASHFILE"
-  { echo "#smartcopy-hashes v1 algo=$HALGO"
-    awk -F'\t' -v cur="$HASHFILE" 'FILENAME == cur { if (FNR > 1) { p = $0; sub(/^[^\t]*\t[^\t]*\t/, "", p); h[p] = $1 "\t" $2 } next }
-      { p = $0; sub(/^[^\t]*\t[^\t]*\t/, "", p); h[p] = $1 "\t" $2 } END { for (p in h) print h[p] "\t" p }' "$HASHFILE" "$new"
-  } > "$tmp" 2>/dev/null && mv -f "$tmp" "$HASHFILE"
-  rm -f "$tmp"; : > "$new"
-}
-# Compare destination-only hashes with the list. Prints differences as ">fc........ path".
-hcompare() {   # hcompare BATCH_LIST RSYNC_OUTPUT
-  awk -v man="$HASHFILE" -v lst="$1" '
-    FILENAME == man { if (FNR > 1) { p = $0; sub(/^[^\t]*\t[^\t]*\t/, "", p); split($0, a, "\t"); h[p] = a[1] } next }
-    FILENAME == lst { want[$0] = 1; next }
-    substr($0, 1, 2) == ">f" { rest = substr($0, 13); sub(/^[0-9]+ /, "", rest); got[substr(rest, 34)] = substr(rest, 1, 32) }
-    END { for (p in want) if (!(p in got) || got[p] != h[p]) print ">fc........ " p }' "$HASHFILE" "$1" "$2"
-}
-
-# Turn checker output ("%i size path" for every file) into just the differences, as "%i path".
-vdiffs() {
-  awk '{
-    i = substr($0, 1, 11)
-    if (i ~ /^[<>ch.*][fdLDS]/ && substr($0, 12, 1) == " ") {
-      rest = substr($0, 13); sub(/^[0-9]+ /, "", rest); rest = substr(rest, 34)
-      flags = substr(i, 3); gsub(/ /, "", flags)
-      if (i ~ /^[<>c*]/ || flags != "") print i " " rest
-    } else if ($0 != "") print }'
-}
 
 # ============================ Verification ============================
 # Compares every file's contents (checksums) in batches, with the same tuning and time-left display,
-# then a quick size/date pass over everything for folders and links. LIST = size<TAB>path lines.
+# then a quick size/date pass over everything for folders and links.
+# LIST = sorted plan records; HOW = select (reuse fingerprints and a stopped check) or full.
 verify() {
-  local list="$1" pre="$LOGDIR/.plan-$STAMP.v" vb vf b f rc todo="$LOGDIR/.plan-$STAMP.vtodo" skipped
+  local list="$1" how="$2" pre="$RUNDIR/v" hpre="$RUNDIR/h" hc="$RUNDIR/hc" full="$RUNDIR/full"
+  local vs="" man="" cj="" sel skipped=0 hn=0 hb=0 vf=0 vb=0 b f rc r j=() x
   : > "$VERIFYLOG"; vrc=0
-  # Skip files already confirmed by an earlier check that was interrupted
-  touch "$VSTATE"
-  awk -F'\t' -v st="$VSTATE" 'FILENAME == st { ok[$0]; next } !($2 in ok)' "$VSTATE" "$list" > "$todo"
-  skipped=$(( $(wc -l < "$list") - $(wc -l < "$todo") ))
-  [ "$skipped" -gt 0 ] && done_msg "$skipped files were already checked in an earlier run — skipping those."
-  list="$todo"
-  # Files with a saved fingerprint (same size, unchanged on the source) only need the destination read
-  local hc="$LOGDIR/.plan-$STAMP.hc" full="$LOGDIR/.plan-$STAMP.full" hpre="$LOGDIR/.plan-$STAMP.h" hn hb skipf="/dev/null"
-  : > "$hc"; cp "$list" "$full"
-  [ "$VERIFY_ONLY" -eq 1 ] && [ -s "${PLAN_TODO:-}" ] && skipf="$PLAN_TODO"
-  if hash_list_ok; then
-    awk -F'\t' -v man="$HASHFILE" -v sk="$skipf" -v hc="$hc" '
-      FILENAME == man { if (FNR > 1) { p = $0; sub(/^[^\t]*\t[^\t]*\t/, "", p); sz[p] = $2 } next }
-      FILENAME == sk { skip[$2] = 1; next }
-      { if (($2 in sz) && sz[$2] == $1 && !($2 in skip)) print > hc; else print }' \
-      "$HASHFILE" "$skipf" "$list" > "$full"
+  if [ "$how" = select ]; then
+    for x in "$JPREFIX".new-*; do [ -s "$x" ] && j+=("$x"); done
+    [ ${#j[@]} -gt 0 ] && journal_fold "$JPREFIX.sorted" "${j[@]}"
+    [ -s "$JPREFIX.sorted" ] && cj="$JPREFIX.sorted"
+    if hash_list_ok; then man="$HASHFILE"
+    elif [ -s "$HASHFILE" ]; then done_msg "The saved fingerprints are from an older version; this check compares with the source and saves new ones."; fi
+    if [ -s "$VSTATE" ]; then
+      vs="$RUNDIR/checkpoint"
+      ( set -o pipefail; LC_ALL=C awk -F'\t' 'NF == 3 { print $0 "\tV" }' "$VSTATE" | csort -k1,1 > "$vs" ) || vs=""
+    fi
+    sel=$(select_checks "$list" "$man" "$cj" "$vs" "$hc" "$full") || \
+      fatal "Couldn't work out which files to check." "Writing the check list on the destination drive failed — it may be full or was disconnected." \
+        "Free some space or reconnect the drive, then run the same command again." "" DESTINATION
+    words "$sel" skipped hn hb vf vb
+    [ "$skipped" -gt 0 ] && done_msg "$skipped files were already checked in an earlier run — skipping those."
+  else
+    cp "$list" "$full"; : > "$hc"
+    words "$(LC_ALL=C awk -F'\t' '{ s += $2 } END { printf "%d %.0f\n", NR, s }' "$full")" vf vb
   fi
-  hn=$(wc -l < "$hc" | tr -d ' ')
+  # Files with a saved fingerprint (unchanged on the source since) only need the destination read
   if [ "$hn" -gt 0 ]; then
-    hb=$(awk -F'\t' '{ s += $1 } END { printf "%.0f", s }' "$hc")
-    done_msg "$hn files ($(hk $(( hb / 1024 )))) have saved fingerprints — checking those by reading only the destination drive."
-    EMPTY_DIR=$(mktemp -d "$LOGDIR/.empty.XXXXXX")
-    make_batches "$hc" "$hpre"
+    done_msg "$hn files ($(hk $(( ${hb%%.*} / 1024 )))) have saved fingerprints — checking those by reading only the destination drive."
+    EMPTY_DIR=$(mktemp -d "$RUNDIR/empty.XXXXXX")
+    make_batches "$hc" "$hpre" hash "$hb" || fatal "Couldn't write the file list on the destination drive." \
+      "The drive may be full or was disconnected." "Free some space or reconnect the drive, then run the same command again." "" DESTINATION
     run_batches hash "$hpre" "$hb" "$hn"
-    : > "$hpre.retry"
-    for b in $RETRY_BATCHES; do cat "$(printf '%s.%04d' "$hpre" "$b")" >> "$hpre.retry"; done
-    cat "$hpre".*.diff >> "$VERIFYLOG" 2>/dev/null
-    # batches that couldn't be read are checked the full way instead
-    [ -s "$hpre.retry" ] && awk -F'\t' -v r="$hpre.retry" 'FILENAME == r { x[$0]; next } ($2 in x)' "$hpre.retry" "$hc" >> "$full"
+    for b in $RETRY_BATCHES; do         # batches that couldn't be read are checked the full way instead
+      printf -v f '%s.%04d' "$hpre" "$b"
+      cut -f1-3 "$f.rec" >> "$full"; vf=$(( vf + BCOUNT[b] )); vb=$(( ${vb%%.*} + BSIZE[b] ))
+    done
     rm -rf "$hpre".* "$EMPTY_DIR"
     HASH_CHECKED=$(( HASH_CHECKED + hn ))
-    [ -s "$full" ] && done_msg "Destination-only part done. Now comparing the remaining files with the source."
+    [ "$vf" -gt 0 ] && done_msg "Destination-only part done. Now comparing the remaining files with the source."
   fi
-  list="$full"
-  vf=$(wc -l < "$list" | tr -d ' '); vb=$(awk -F'\t' '{ s += $1 } END { printf "%.0f", s }' "$list")
   FULL_CHECKED=$(( FULL_CHECKED + vf ))
   if [ "$vf" -gt 0 ]; then
-    make_batches "$list" "$pre"
+    make_batches "$full" "$pre" check "$vb" || fatal "Couldn't write the file list on the destination drive." \
+      "The drive may be full or was disconnected." "Free some space or reconnect the drive, then run the same command again." "" DESTINATION
     run_batches verify "$pre" "$vb" "$vf"
     for b in $RETRY_BATCHES; do         # batches cut off by a drive dropping out: once more
-      f=$(printf '%s.%04d' "$pre" "$b"); wait_for_mounts
-      "$RSYNC" "${META[@]}" -r --checksum "${CSUM[@]}" --dry-run -ii --out-format='%i %l %C %n' \
-        "${EXCLUDES[@]}" --files-from="$f" "$SRC/" "$DST/" > "$f.out" 2>&1
+      printf -v f '%s.%04d' "$pre" "$b"; wait_for_mounts
+      ( in_dst "$RSYNC" "${META[@]}" -r --checksum "${CSUM[@]}" --dry-run -ii "--out-format=$FMT" \
+        "${EXCLUDES[@]}" --from0 --files-from="$f" "$SRC/" ./ ) > "$f.out" 2> "$f.err"
       rc=$?
       case $rc in 0|24) ;; 23) HAD23=1 ;; 20) RESULT="⏸ Stopped during verification — run the same command again to redo it."; exit 20 ;; *) vrc=$rc ;; esac
+      r=$(finish_check "$f.out" "$JOURNAL" "$VERIFYLOG"); cat "$f.err" 2>/dev/null >> "$VERIFYLOG"
     done
-    cat "$pre".*.out 2>/dev/null | vdiffs >> "$VERIFYLOG"
-    hash_merge "$HASH_NEW"
     [ "$HAD23" -eq 1 ] && [ "$vrc" -eq 0 ] && vrc=23
     rm -f "$pre".*
   fi
-  rm -f "$todo" "$hc" "$full"
+  rm -f "$hc" "$full" "$RUNDIR/checkpoint"
   wait_for_mounts
-  "$RSYNC" "${META[@]}" --dry-run --itemize-changes "${EXCLUDES[@]}" "$SRC/" "$DST/" >> "$VERIFYLOG" 2>&1 &
+  in_dst "$RSYNC" "${META[@]}" ${NOINC[@]+"${NOINC[@]}"} --dry-run --itemize-changes --out-format='%i %n' "${EXCLUDES[@]}" "$SRC/" ./ >> "$VERIFYLOG" 2>&1 &
   heartbeat $! "Checking folders and links"
   wait $!; rc=$?
   case $rc in 0|24) ;; 23) [ "$vrc" -eq 0 ] && vrc=23 ;; 20) RESULT="⏸ Stopped during verification — run the same command again to redo it."; exit 20 ;; *) [ "$vrc" -eq 0 ] && vrc=$rc ;; esac
-  DIFFS=$(grep -E '^[<>ch*]' "$VERIFYLOG" | sed 's/^[^ ]* //' | sort -u | wc -l | tr -d ' ')   # count each file once
-  META_DIFFS=$(sort -u "$VERIFYLOG" | awk '$1 ~ /^\./ { f = (substr($1,2,1)=="d") ? substr($1,6) : substr($1,5);
-                                 if (f ~ /[tpogaxnb]/) c++ } END { print c+0 }')
+  words "$(diff_summary "$VERIFYLOG" "$RUNDIR/repair")" DIFFS META_DIFFS
+  rm -f "$VSTATE"                       # the check is complete: a later check starts afresh
 }
 
 # ============================ Main ============================
-PERSISTENT=0
-VSTATE="$LOGDIR/.verified-$(printf '%s|%s' "$SRC_ID" "$DST" | shasum | cut -c1-12)"
-HASHFILE="$DST/.smartcopy-hashes"; HASH_NEW="$LOGDIR/.hashnew-$STAMP"; : > "$HASH_NEW"
+PERSISTENT=0; COPY_BATCH_FAILED=0
 HASH_CHECKED=0; FULL_CHECKED=0
 if [ "$VERIFY_ONLY" -eq 1 ]; then STEP_TOTAL=2; elif [ "$VERIFY" = 0 ]; then STEP_TOTAL=3; else STEP_TOTAL=4; fi
 if [ "$VERIFY_ONLY" -eq 1 ]; then
@@ -1444,19 +1833,31 @@ else
   step "List the files" "Comparing both drives to see what's already copied and what isn't." "copy what's missing"
 fi
 plan_scan
+post_scan_checks
 if [ "$VERIFY_ONLY" -eq 0 ]; then
   if [ "$TODO_FILES" -gt 0 ]; then
     step "Copy the files" "Copying $TODO_FILES files ($(hk $(( TODO_BYTES / 1024 )))) that are missing or changed. The first few minutes measure which speed setting is fastest." "a final pass for folders and links"
     batch_copy
     done_msg "Copied $TODO_FILES files."
-    rm -f "$VSTATE"                    # files changed: earlier check results no longer apply
   else
     step "Copy the files" "Nothing to copy — everything is already on the destination." "a final pass for folders and links"
   fi
-  step "Final pass" "Creating folders and links, and catching anything that changed or was missed. This mostly just reads; it can take several minutes on a big drive." \
-    "$([ "$VERIFY" = 0 ] && echo "the report" || echo "check every file's contents against the source")"
-  copy_loop "Final pass" || PERSISTENT=1
-  charvest "$LOG" > "$HASH_NEW"; hash_merge "$HASH_NEW"      # save fingerprints of everything copied
+  # The final pass only needs the folders and links when every file was copied cleanly and the final
+  # check will run anyway; otherwise (or with hard links) it goes through everything, as a safety net.
+  if [ "$VERIFY" != 0 ] && [ "$COPY_BATCH_FAILED" -eq 0 ] && [ "${N_HLINKS:-0}" -eq 0 ] && [ -s "$PLAN_OTHER" ]; then
+    step "Final pass" "Creating folders and links and setting their dates. Every file was copied cleanly and the check comes next, so this only visits the $N_OTHER folders and links, not every file." \
+      "check every file's contents against the source"
+    nul_list < "$PLAN_OTHER" > "$RUNDIR/other0"
+    META_ALL=("${META[@]}"); META=(); for x in "${META_ALL[@]}"; do [ "$x" = -rt ] && x=-t; META+=("$x"); done   # no recursion
+    copy_loop "Final pass" --from0 --files-from="$RUNDIR/other0" || PERSISTENT=1
+    META=("${META_ALL[@]}")
+  else
+    step "Final pass" "Creating folders and links, and catching anything that changed or was missed. This mostly just reads; it can take several minutes on a big drive." \
+      "$([ "$VERIFY" = 0 ] && echo "the report" || echo "check every file's contents against the source")"
+    copy_loop "Final pass" || PERSISTENT=1
+  fi
+  # files changed: earlier check results no longer apply
+  { [ "$TODO_FILES" -gt 0 ] || [ "$COPIED_FILES" -gt 0 ]; } && rm -f "$VSTATE"
   done_msg "Final pass done."
 fi
 
@@ -1467,20 +1868,21 @@ fi
 
 step "Check every file" "Proving the copy is exact. Files with a saved fingerprint are checked by reading only the destination; the rest are compared with the source (and their fingerprints saved for next time). All files are already copied — you can press Ctrl-C to stop this at any time; next time it continues where it stopped:
 sudo $0 --verify-only \"$SRC\" \"$DST\"" "the report"
-verify "$PLAN_ALL"
+verify "$PLAN" select
 done_msg "Check finished."
 
 if [ "$DIFFS" -gt 0 ]; then
   first_diffs=$DIFFS
   echo "  $DIFFS items didn't match — copying just those again, then re-checking them..."
-  RLIST="$LOGDIR/.plan-$STAMP.repair"
-  grep -E '^[<>ch*]f' "$VERIFYLOG" | sed 's/^[^ ]* //' | sort -u > "$RLIST"
-  if [ -s "$RLIST" ]; then copy_loop "Repair" -r --checksum "${CSUM[@]}" --files-from="$RLIST" || PERSISTENT=1; fi
+  RLIST="$RUNDIR/repair"; mv -f "$RUNDIR/repair" "$RLIST.list" 2>/dev/null; RLIST="$RLIST.list"
+  if [ -s "$RLIST" ]; then
+    nul_list < "$RLIST" > "$RLIST.0"
+    copy_loop "Repair" -r --checksum "${CSUM[@]}" --from0 --files-from="$RLIST.0" || PERSISTENT=1
+  fi
   if grep -qE '^[<>c*][dLDS]' "$VERIFYLOG"; then copy_loop "Repair folders and links" || PERSISTENT=1; fi
-  charvest "$LOG" > "$HASH_NEW"; hash_merge "$HASH_NEW"
-  awk '{ print "0\t" $0 }' "$RLIST" > "$RLIST.v"
+  LC_ALL=C awk '{ print $0 "\t0\t-" }' "$RLIST" > "$RLIST.v"
   echo "  Re-checking the repaired files..."
-  verify "$RLIST.v"
+  verify "$RLIST.v" full
   if [ "$DIFFS" -eq 0 ]; then
     add_issue PROBLEM GENERAL "$first_diffs file(s) didn't match after copying, and were repaired" \
 "The final check found files on the destination whose contents differed from the source even though they looked the same (same size and date). They were copied again and now match. Silent damage like this usually comes from an unreliable drive, cable or hub — or a file that changed during the copy." \

@@ -15,7 +15,8 @@ How smartcopy works, and why each decision was made. The numbers come from real 
 ```
 STEP 1  List the files     one rsync dry run over both drives → every source file, and which still need copying
 STEP 2  Copy the files     only what's missing or changed, in batches, 1 or 4 at a time (tuned automatically)
-STEP 3  Final pass         normal recursive rsync: folders, links, anything missed; retries until stable
+STEP 3  Final pass         folders and links only, when every file copied cleanly and the check follows;
+                           otherwise a normal recursive rsync over everything; retries until stable
 STEP 4  Check every file   fingerprints compared (destination-only where a saved fingerprint exists)
         Report             plain English; problems first, then notes
 ```
@@ -24,6 +25,7 @@ STEP 4  Check every file   fingerprints compared (destination-only where a saved
 
 ## Resuming and retrying
 
+- **Fingerprints survive interruptions.** Each batch's fingerprints are appended to a journal on the destination as soon as the batch finishes, and folded into the hash list when the run ends (or by the next run, if this one was cut off). Before v12.3 they were only saved after the final pass, so a stopped copy lost them and the next check had to read both drives for everything copied before the stop.
 - **Resume is mostly free with rsync.** Files already copied match on size and date and are skipped. A marker file (`.smartcopy-target`) records what the destination is a copy of, so a rerun resumes without asking for confirmation again.
 - **Half-copied files.** On APFS/HFS+, partial files go to `.rsync-partial/`, and large files resume from where they stopped. On exFAT, files are written in place (`--inplace`). A file cut off part-way ends up with the wrong size or date, so the next pass copies it again. This avoids an extra rename for every file, which is slow on exFAT.
 - **Progress, not a fixed retry count.** It keeps retrying as long as passes make progress, and gives up after `MAX_STUCK` (6) passes in a row with none. Progress means files completed or the destination growing, which covers one huge file being cut off part-way each time.
@@ -38,7 +40,8 @@ STEP 4  Check every file   fingerprints compared (destination-only where a saved
 - **A check can't avoid reading both copies.** Any hash has to read every byte, so hashing alone doesn't remove reads. The saving comes from reading the source only once, as below.
 - **The hash list.** rsync can report each file's fingerprint while it copies (`%C` in the log format), using data it's already reading. These go into `.smartcopy-hashes` on the destination. A full check also saves the source fingerprint of every file that matched. Later checks hash only the destination copy (`rsync --checksum --dry-run` into an empty folder, which reads one side and writes nothing) and compare with the list. If the source is the slower drive (about 30 MB/s from a hard disk against 200–460 MB/s from the SSD), that's an estimated **85–92% less time**. Files that changed on the source since they were copied are always compared with the source instead.
 - **Repairs are targeted.** Files that don't match are re-copied with `--checksum`, then just those files are checked again.
-- **A stopped check resumes.** Batches that came out clean are recorded, so a stopped check skips them on the next run.
+- **A fingerprint is only used while it can still be true.** Each saved fingerprint records the source file's size and modification date when it was taken. It is used only while the source file still has both; otherwise the file is compared with the source. When the hash list is rewritten, entries for files that no longer exist or have changed are dropped, so it never grows stale.
+- **A stopped check resumes.** Batches that came out clean are recorded (with each source file's size and date), so a stopped check skips them on the next run, unless the source file changed since. The record is cleared when a check finishes. (Before v12.3 it was never cleared after a finished check, so the next `--verify-only` skipped every file and couldn't find new damage.)
 
 ## Speed
 
@@ -48,6 +51,19 @@ Findings from the real runs:
 - **Parallel copying helps SSDs and hurts hard drives**, because a hard drive's head jumps between files. So it isn't hard-coded: big jobs copy 1 file at a time for about 2 minutes, then 4 at a time for about 2 minutes, and keep whichever is faster. One real run measured 22 MB/s against 27 MB/s and switched to 4. Copying and checking are tuned separately.
 - **Batching.** The list of files to copy is cut into batches of 1–8 GB or 5,000 files, in folder order. Each worker runs `rsync --files-from` on its batch.
 - **Spotlight** indexing on the destination is paused during the run and restored afterwards, including after a crash on the next run. If two copies run to the same drive, it stays off until the last one finishes.
+
+## Handling millions of files (v12.3)
+
+The copying itself is rsync's. Everything smartcopy does around it — planning, batching, progress, fingerprints, the report — was rewritten so its cost grows in step with the number of files and its memory stays bounded, measured up to 3 million files (see [PERFORMANCE.md](PERFORMANCE.md)).
+
+- **One record format, safe for every file name.** Lists are tab-separated lines, one per file. Names are stored the way rsync prints them on its output (control characters as `\#ooo`), with tabs also escaped, so a stored name never contains a tab or line break. They're turned back into real names only when handed to rsync, as NUL-separated lists (`--from0`). Names with tabs and line breaks, which earlier versions couldn't handle, now work. rsync's `--log-file` isn't parsed any more: it doesn't escape names.
+- **Sorted lists, merged instead of looked up.** The file list is sorted once by name (`LC_ALL=C sort`, with a fixed memory buffer and its temporary files in the run's folder on the destination). The hash list is kept sorted. Deciding how each file is checked, adding new fingerprints and pruning old ones are all single passes over sorted lists merged together (`sort -m`), never tables of every file held in memory. New fingerprints are sorted exactly once, and the hash list is rewritten once per run instead of up to three times.
+- **Each batch's output is read once.** When a batch finishes, its output is read once to count what it did, save fingerprints and note differences. The progress line only reads the batches still running (at most 4 × 5,000 lines), not every batch so far. Before, the work per refresh grew with the job, so the total grew with the square of the number of files.
+- **Destination-only checks hold one batch in memory.** Each batch carries its own expected fingerprints. Before, every batch re-read the whole hash list.
+- **Fewer passes over the drives.** The folder size for the space check comes from step 1 instead of a separate `du`; on FAT32 the files of 4 GB or more come from step 1 instead of a `find`. The final pass visits only folders and links when that's safe (see the steps above). A one-off tidy-up from old versions runs once per copy instead of after every interruption.
+- **Fewer programs started.** The progress line is built in the shell: sizes, times and the finish time need no `awk` or `date` each second (`date` only when the shown minute changes; `tput` every 15 s). Drive details from `diskutil` are read once per drive.
+- **Errors aren't lost in pipelines.** The listing reports both rsync's and the list writer's exit codes; a listing that was cut off is retried, not used half-finished. The dry run reports rsync's exit code (it used to report awk's). A fingerprint journal is only deleted after it has been merged successfully.
+- **rsync's own memory.** With hard links (`-H`, used for APFS and Mac OS Extended), rsync is run with `--no-inc-recursive`, as before, because incremental listing with `-H` hung or failed in testing when an item couldn't be replaced (rsync 3.2.7). rsync then holds its file list in memory (roughly 100 bytes per file). For exFAT, FAT32 and other destinations, rsync lists incrementally and its memory stays small.
 
 ## The time-left estimate
 
@@ -85,6 +101,11 @@ Each of these was found on a real Mac and wasn't reproducible in the original te
 | Accented, Arabic and emoji names "disappeared" | rsync escaping (see Privacy) | `-8` on every call |
 | `--background` silently didn't start | The script was re-launched through a path that wasn't executable | Re-launch with `/bin/bash` and the script's real path |
 | Finish time cut off | The line was wider than the Terminal window | Build the line by priority |
+| A second `--verify-only` checked nothing (v12.3) | The record of confirmed files was never cleared after a finished check | Clear it when a check finishes; check source size and date before skipping |
+| A stopped copy lost its fingerprints (v12.3) | Fingerprints were saved only after the final pass | Save them as each batch finishes |
+| "Folder in the way" errors missing from the report (v12.3) | rsync's "could not make way" message has no `rsync:` prefix | Recognise it and explain it |
+| Possible hang in the check (v12.3) | Incremental listing with `-H` hangs when an item can't be replaced | `--no-inc-recursive` whenever `-H` is used |
+| Dry run exit code (v12.3) | The pipeline reported awk's status, not rsync's | Take rsync's status from the pipeline |
 
 ## Ideas considered and not done
 

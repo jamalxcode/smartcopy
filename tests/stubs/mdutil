@@ -1,0 +1,4 @@
+#!/bin/bash
+# Test stand-in for macOS mdutil (Spotlight).
+case "$1" in -s) echo "$2:"; echo "	Indexing enabled." ;; esac
+exit 0

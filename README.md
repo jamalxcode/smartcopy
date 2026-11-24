@@ -14,7 +14,8 @@ sudo smartcopy "/Volumes/Archive" "/Volumes/Backup/Archive"
 - **Waits for drives.** If a drive disconnects, it waits for it to come back and then continues.
 - **Retries, but knows when to stop.** Failed files are retried. Files that keep failing the same way (for example because of damaged areas on a drive) are reported instead of retried for ever.
 - **Checks the result.** It compares fingerprints (xxh128 hashes) of every file on both drives, re-copies any file that doesn't match, then checks it again.
-- **Re-checks faster.** Each file's fingerprint is saved on the destination, so later checks only need to read the destination drive.
+- **Re-checks faster.** Each file's fingerprint is saved on the destination, so later checks only need to read the destination drive. Fingerprints are saved as the copy goes, so they survive an interruption.
+- **Handles millions of files.** Its own bookkeeping grows in step with the number of files, with bounded memory (measured up to 3 million files).
 - **Tunes its own speed.** On big jobs it measures copying 1 file at a time against 4 at a time, then uses the faster setting.
 - **Explains problems plainly.** It recognises about 17 kinds of problem, such as read errors, a full drive, missing permissions or file names a drive doesn't allow. For each it says which drive was involved, how to fix it and how to avoid it.
 - **Shows clear progress.** The work is shown as numbered steps, with one status line showing the time left and the expected finish time.
@@ -186,6 +187,8 @@ See [PRIVACY.md](PRIVACY.md). In short:
 - [`install.sh`](install.sh): installer and uninstaller
 - [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md): what to install, and the macOS tools it uses
 - [`docs/DESIGN.md`](docs/DESIGN.md): how it works and why
+- [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md): measured speed, memory and work before and after v12.3, and how to reproduce them
+- [`tests/run.sh`](tests/run.sh) and [`bench/`](bench/README.md): automated tests (including the privacy rules) and benchmarks, run on Linux with stand-ins for the macOS tools
 - [`docs/CONVERSATION.md`](docs/CONVERSATION.md): how the tool was designed, one request at a time
 - [`CHANGELOG.md`](CHANGELOG.md): version history
 
@@ -197,5 +200,4 @@ MIT. See [LICENSE](LICENSE).
 
 - It makes a data copy, not a bootable clone of macOS.
 - exFAT destinations work but are slower on a Mac and don't keep owners, permissions, Finder tags or symbolic links. APFS is faster and keeps everything.
-- File names containing a tab or a line break aren't supported.
 - Files that are on the destination but not on the source are left alone and not reported, because the tool never deletes.
