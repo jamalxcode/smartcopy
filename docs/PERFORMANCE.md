@@ -1,8 +1,12 @@
-# Performance: v12.2 → v12.3
+# Performance
+
+Measurements of v12.3 against v12.2 (list handling), and of v13's streaming engine against the batch engine ([below](#v13-streaming-engine-against-batch-engine)).
+
+## v12.2 → v12.3
 
 v12.3 removes avoidable work from everything smartcopy does around rsync, without changing how files are copied. This page has the measurements, how they were taken and how to reproduce them.
 
-## In short
+### In short
 
 | | v12.2 | v12.3 |
 |---|---|---|
@@ -17,7 +21,7 @@ v12.3 removes avoidable work from everything smartcopy does around rsync, withou
 
 The copying itself is rsync's and runs at about the same speed (the copy step measured 219 → 241 MB/s): the gains come from fewer passes over the drives, list handling that doesn't grow with the square of the number of files, and fewer programs started. On a real Mac the absolute times differ (USB drives, exFAT), but the work removed is the same.
 
-## Test bed
+### Test bed
 
 - Linux container, 4 vCPUs, 16 GB RAM; rsync 3.2.7 (xxh128); mawk 1.3.4 as `awk` (BWK awk, as on macOS, was checked separately for correctness); GNU sort.
 - Source and destination are separate ext4 images, loop-mounted at `/Volumes/SCSRC` and `/Volumes/SCDST`, on the same virtual disk. The destination is reformatted before every fresh run, and the page cache is dropped before every run.
@@ -27,7 +31,7 @@ The copying itself is rsync's and runs at about the same speed (the copy step me
 
 The v12.2 baseline was recorded before any change was made (`bench/results/baseline-v12.2-before-changes.jsonl`) and again alongside v12.3 (`bench/results/e2e.jsonl`). The final v12.3 code was measured once more after the last fixes (`bench/results/e2e-final.jsonl`).
 
-## End to end
+### End to end
 
 Each table is one run of each version in the same session (`bench/results/e2e.jsonl`). Wall time is the time to a fully verified finish.
 
@@ -129,7 +133,7 @@ The final v12.3 code (after the last review fixes) measured again: first copy + 
 
 **About the `--verify-only` rerun:** v12.3 is slower here because v12.2 didn't actually check anything. It never cleared its record of confirmed files after a finished check, so the second `--verify-only` skipped every file (the `recheck` test shows v12.2 missing a damaged file this way). v12.3 checks every file again, reading only the destination for files with a valid fingerprint.
 
-## File-list handling at scale
+### File-list handling at scale
 
 `bench/micro.sh` times only smartcopy's list handling (no copying), on synthetic lists, with peak memory of the largest process. v12.2's code is run verbatim and is skipped at 3,000,000 files, where its destination-only check would take over an hour.
 
@@ -163,7 +167,7 @@ The final v12.3 code (after the last review fixes) measured again: first copy + 
 
 The remaining memory that grows with the number of files is rsync's own file list when hard links are kept (APFS/HFS destinations use `--no-inc-recursive`, about 100 bytes per file, as in v12.2; see [DESIGN.md](DESIGN.md)).
 
-## Correctness, before and after
+### Correctness, before and after
 
 The same automated tests (`tests/run.sh`) were run against both versions:
 
@@ -184,6 +188,79 @@ The same automated tests (`tests/run.sh`) were run against both versions:
 
 The disconnect test unmounts the destination lazily, which leaves the empty mount-point folder in place. On a Mac that folder normally disappears on unplugging, but it can also be left behind or recreated, which is the case `in_dst` protects against. The library and a subset of the end-to-end tests (`lib copy corrupt checkpoint exfat errors`) also pass with BWK awk (`SC_AWK=original-awk`), the awk family macOS uses. macOS's bash 3.2 couldn't be run here; the script avoids bash 4 features, here-documents and process substitution, and was checked for them.
 
+## v13: streaming engine against batch engine
+
+The same script (v13.0) was run with `--engine batch` (v12.3's list-then-copy engine) and with `--engine stream` (the default from v13), on the test bed described above. The main figures come from three interleaved runs of each engine (`bench/results/engines-repeat.jsonl`); everything else is single runs (`bench/results/engines.jsonl`).
+
+### In short
+
+| | batch engine | stream engine |
+|---|---|---|
+| First file copied, 250,000 files | 5.8 s | **0.8 s** |
+| First file copied, 500,000 files | 12.2 s | **2.7 s** |
+| Verified finish, 50,006 files (1.65 GB) | 16.7 s | **13.2 s** (−21%) |
+| Verified finish, 250,000 files | 45.7 s | **37.0 s** (−19%) |
+| Verified finish, 500,000 files | 114.0 s | **88.9 s** (−22%) |
+| Peak memory (whole process tree) | 66–153 MB | 90–159 MB: a little higher (listing, copiers and checker run at the same time), still bounded |
+
+With the batch engine, the time to the first copied file grows with the size of the source, because both drives are listed completely first. With the stream engine it stays at the time needed to find the first 100 files, then copying starts. Totals improve because listing, copying and checking overlap: by the time the listing ends, much of the copying and some of the checking are already done.
+
+### Three interleaved runs
+
+| | batch engine (v12.3) | stream engine (v13) | change (medians) |
+|---|---|---|---:|
+| mixed: 50,006 files, 1.65 GB — verified finish (s) | 16.95 / 16.63 / 16.72 | 13.08 / 13.22 / 13.76 | -21% |
+| mixed: 50,006 files, 1.65 GB — first file copied (s) | 2.8 / 2.8 / 2.8 | 0.77 / 0.77 / 0.77 | -72% |
+| mixed: 50,006 files, 1.65 GB — listing + copying done (s) | 10.52 / 10.35 / 10.36 | 9.15 / 8.01 / 7.93 | -23% |
+| mixed: 50,006 files, 1.65 GB — CPU user+sys (s) | 17.1 / 16.1 / 16.0 | 16.6 / 16.0 / 16.7 | +3% |
+| mixed: 50,006 files, 1.65 GB — peak memory, whole tree (MB) | 66.1 / 66.3 / 65.8 | 89.2 / 92.8 / 97.5 | +40% |
+| tiny: 250,000 files, 308 MB — verified finish (s) | 45.72 / 45.95 / 44.57 | 37.58 / 37.0 / 36.45 | -19% |
+| tiny: 250,000 files, 308 MB — first file copied (s) | 5.83 / 5.82 / 5.82 | 0.77 / 0.78 / 0.77 | -87% |
+| tiny: 250,000 files, 308 MB — listing + copying done (s) | 23.48 / 23.49 / 22.4 | 20.07 / 19.37 / 18.01 | -18% |
+| tiny: 250,000 files, 308 MB — CPU user+sys (s) | 49.8 / 51.4 / 49.1 | 50.3 / 49.7 / 49.8 | +0% |
+| tiny: 250,000 files, 308 MB — peak memory, whole tree (MB) | 93.1 / 93.1 / 93.6 | 89.5 / 95.3 / 90.1 | -3% |
+
+### 500,000 files (one run each)
+
+#### large — first-copy (exit codes: batch engine 0, stream engine 0)
+
+| | batch engine | stream engine | change |
+|---|---:|---:|---:|
+| Wall time (s) | 114.03 | 88.89 | -22% |
+| CPU user+sys (s) | 121.47 | 106.82 | -12% |
+| Peak memory, whole tree (MB) | 152.5 | 158.6 | +4% |
+| Largest process (MB) | 112.5 | 134.2 | +19% |
+| Time to first transfer (s) | 12.16 | 2.65 | -78% |
+| Copy step (s) | 60.45 | 59.22 | -2% |
+| Listing + copying done at (s) | 71.97 | 59.69 | -17% |
+
+### Work done (mixed, under strace; one run each)
+
+#### mixed — first-copy-strace (exit codes: batch engine 0, stream engine 0)
+
+| | batch engine | stream engine | change |
+|---|---:|---:|---:|
+| Programs started | 2201 | 2497 | +13% |
+| Processes/threads created | 1993 | 2294 | +15% |
+| Metadata calls (stat, xattr...) | 1670669 | 2108461 | +26% |
+| File opens | 225469 | 262658 | +16% |
+| Directory reads | 20254 | 30362 | +50% |
+| File-system changes | 165332 | 165374 | +0% |
+| All system calls | 11436894 | 12866229 | +12% |
+| Wall time under strace (s) | 261.02 | 336.19 | +29% |
+
+The stream engine makes about 12% more system calls. They come from roughly 300 more short-lived helper programs: progress counts, reading each batch's output, more rsync starts from the small first batches, and the checker's batches. There's also a second lookup of each name: the listing checks it against an empty folder, then the copier checks it against the destination. Under strace every system call is slowed down a lot, so the stream engine is slower there. Without strace, the same work finishes 19–22% sooner, because it overlaps. On a spinning hard drive the overlap means the drive's head moves between listing and copying, so the total time may not improve there (see [STREAMING.md](STREAMING.md)). The time to the first file still does.
+
+### Correctness
+
+The full test suite passes on both engines: 62 of 62 checks with the stream engine, including copying while listing, a listing killed mid-way (falls back and finishes verified), and the destination unplugged mid-copy. With `SMARTCOPY_ENGINE=batch` it's 53 of 53 (the stream-only tests are skipped). The library, copy, stream, fallback and exFAT tests also pass with BWK awk (22 of 22).
+
+### Not compared
+
+- **Resume after an interruption:** each engine was stopped halfway through its own copy time, so the two runs had different amounts left to copy, and the timings aren't comparable. Both resumed and finished verified (`bench/results/engines.jsonl`).
+- **`--verify-only`** uses the batch engine's listing in both cases (25.4 s against 26.6 s for 250,000 files: the same code).
+- One single run of the batch engine on the mixed dataset took 100 s, because the test disk stalled during copying. The interleaved repeats above (16.6–17.0 s) are the representative figures.
+
 ## Reproducing
 
 ```bash
@@ -192,5 +269,7 @@ git show 8005cbd:smartcopy.sh > /tmp/smartcopy-v12.2.sh
 sudo bench/bench.sh results.jsonl old=/tmp/smartcopy-v12.2.sh new=./smartcopy.sh
 bench/micro.sh 100000 300000 1000000 3000000 > micro.jsonl
 python3 bench/summarize.py results.jsonl micro.jsonl
-sudo tests/run.sh                               # 14 test groups, 51 checks
+sudo bench/bench.sh engines.jsonl batch=./smartcopy.sh@--engine=batch stream=./smartcopy.sh@--engine=stream
+sudo tests/run.sh                               # 16 test groups, both engines:
+sudo SMARTCOPY_ENGINE=batch tests/run.sh
 ```

@@ -24,12 +24,16 @@
 #   errors      an rsync error naming a file: the report explains it without the name; exit code 3
 #   exfat       exFAT mode (contents and dates only, write in place, folders-and-links final pass)
 #   stop        --background then --stop: every rsync stops; running again finishes the copy
+#   stream      streaming engine: copies while listing, checks copied files as it goes, totals marked
+#               as "found so far" until the listing ends
+#   streamfail  the listing is killed mid-way: the run carries on with a full listing and finishes verified
 #   lib         unit tests of the file-list library (record format, merges, batches)
+# Env: SMARTCOPY_ENGINE=batch runs the tests on the earlier engine (the fallback).
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$(cd "$here/.." && pwd)/smartcopy.sh"
 if [ $# -gt 0 ] && [ -f "$1" ]; then SCRIPT="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"; shift; fi
-TESTS="${*:-lib copy privacy nowrites nonet corrupt recheck checkpoint resume disconnect dryrun errors exfat stop}"
+TESTS="${*:-lib copy stream streamfail privacy nowrites nonet corrupt recheck checkpoint resume disconnect dryrun errors exfat stop}"
 IMG="${IMG:-/tmp/sc-test-img}"; W="${W:-/tmp/sc-test-work}"
 SRCV=/Volumes/SCTSRC; DSTV=/Volumes/SCTDST
 PASS=0; FAIL=0; FAILED=""
@@ -171,7 +175,7 @@ t_recheck() {
   local f="$DSTV/copy/L1-002/L2-000/L3-00002/file-0000002.dat" m
   m=$(stat -c %Y "$f"); printf 'Y' | dd of="$f" bs=1 seek=5 conv=notrunc 2>/dev/null; touch -d "@$m" "$f"
   sc "$W/r3.out" --verify-only "$SRCV/data" "$DSTV/copy"
-  check "a finished check isn't reused: the next check doesn't skip files" bash -c "! grep -q 'already checked in an earlier run' $W/r3.out"
+  check "a finished check isn't reused: the next check doesn't skip files" bash -c "! grep -q 'already checked' $W/r3.out"
   check "the next check finds damage made after the last check" grep -q "didn't match after copying" "$(report_of)"
 }
 
@@ -190,7 +194,7 @@ t_checkpoint() {
   local name; name=$(head -1 "$vs" | cut -f1)
   printf 'Z' | dd of="$SRCV/data/$name" bs=1 seek=1 conv=notrunc 2>/dev/null; touch -d '+5 seconds' "$SRCV/data/$name"
   sc "$W/k3.out" --verify-only "$SRCV/data" "$DSTV/copy"
-  check "resumed check skips what was already confirmed" grep -q "already checked in an earlier run" "$W/k3.out"
+  check "resumed check skips what was already confirmed" grep -q "already checked" "$W/k3.out"
   check "but not a source file that changed since: it is compared and repaired" grep -q "didn't match after copying" "$(report_of)"
   check "copy identical afterwards" same_trees
 }
@@ -210,11 +214,11 @@ t_resume() {
 }
 
 t_disconnect() {
-  NFILES=6000 fresh --big 3 --big-mb 64
+  NFILES=6000 fresh --big 4 --big-mb 128
   bash "$SCRIPT" --yes --jobs 1 "$SRCV/data" "$DSTV/copy" > "$W/d.out" 2>&1 < /dev/null &
   local p=$! i=0
-  while [ $i -lt 600 ] && ! grep -q "STEP 2" "$W/d.out"; do sleep 0.1; i=$(( i + 1 )); done
-  sleep 1
+  # unplug while files are being copied (both engines)
+  while [ $i -lt 600 ] && [ -z "$(ls -A "$DSTV/copy/L1-000" 2>/dev/null)" ]; do sleep 0.1; i=$(( i + 1 )); done
   umount -l "$DSTV"                                   # "unplug" the destination
   i=0; while [ $i -lt 900 ] && ! grep -q "Waiting for the destination drive" "$W/d.out"; do sleep 0.1; i=$(( i + 1 )); done
   check "smartcopy pauses and waits for the destination" grep -q "Waiting for the destination drive" "$W/d.out"
@@ -226,6 +230,34 @@ t_disconnect() {
   check "copy finishes after the drive comes back (exit $rc)" [ "$rc" -eq 0 ]
   check "copy identical" same_trees
   check "report notes the disconnection" grep -q "destination drive disconnected" "$(report_of)"
+}
+
+t_stream() {
+  [ "${SMARTCOPY_ENGINE:-stream}" = stream ] || { ok "skipped (engine ${SMARTCOPY_ENGINE})"; return; }
+  NFILES=12000 fresh --big 2 --big-mb 64
+  sc "$W/st.out" "$SRCV/data" "$DSTV/copy"; local rc=$?
+  check "streaming copy exits 0 (got $rc)" [ "$rc" -eq 0 ]
+  check "one step lists and copies" grep -q "STEP 1 of 3: List and copy the files" "$W/st.out"
+  check "totals shown as found so far while listing" grep -q "found so far" "$W/st.out"
+  check "copied files checked as they were copied" grep -qE "copied [0-9]+\. [0-9]+ already checked" "$W/st.out"
+  check "final check skips them" grep -q "already checked (as they were copied" "$W/st.out"
+  check "copy identical" same_trees
+  sc "$W/st2.out" "$SRCV/data" "$DSTV/copy"; rc=$?
+  check "second run copies nothing and verifies (exit $rc)" bash -c "[ $rc -eq 0 ] && grep -q 'copied 0\.' $W/st2.out"
+}
+
+t_streamfail() {
+  [ "${SMARTCOPY_ENGINE:-stream}" = stream ] || { ok "skipped (engine ${SMARTCOPY_ENGINE})"; return; }
+  NFILES=40000 fresh
+  bash "$SCRIPT" --yes --jobs 1 "$SRCV/data" "$DSTV/copy" > "$W/sf.out" 2>&1 < /dev/null &
+  local p=$! i=0 lp=""
+  while [ $i -lt 3000 ] && [ -z "$lp" ]; do lp=$(pgrep -f "dry-run.*rsync-logs/.run-.*/empty\." | head -1); i=$(( i + 1 )); done
+  [ -n "$lp" ] && kill -9 $lp                           # cut the listing off
+  wait $p; local rc=$?
+  check "listing was cut off" [ -n "$lp" ]
+  check "run carries on with a full listing" grep -q "The listing was cut off" "$W/sf.out"
+  check "and finishes verified (exit $rc)" bash -c "[ $rc -eq 0 ] && grep -q 'Copied and verified' $W/sf.out"
+  check "copy identical" same_trees
 }
 
 t_dryrun() {

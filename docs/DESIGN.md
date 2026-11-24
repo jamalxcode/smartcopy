@@ -12,6 +12,8 @@ How smartcopy works, and why each decision was made. The numbers come from real 
 
 ## The run, step by step
 
+From v13, copies use the **streaming engine**: steps 1 and 2 below run together as one pipeline (listing the source, copying batches as they're found, and checking copied files as they finish), and step 4 then only checks what wasn't confirmed already. The pipeline, its bounded queues and its fallback are described in [STREAMING.md](STREAMING.md). The steps below are the **batch engine** (`--engine batch`), which is also what the streaming engine falls back to if its listing is cut off, and what `--verify-only` uses.
+
 ```
 STEP 1  List the files     one rsync dry run over both drives → every source file, and which still need copying
 STEP 2  Copy the files     only what's missing or changed, in batches, 1 or 4 at a time (tuned automatically)

@@ -1,5 +1,15 @@
 # Changelog
 
+## v13.0: Streaming engine — listing, copying and checking at the same time
+See [docs/STREAMING.md](docs/STREAMING.md) for the design and [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for measurements.
+- **One pipeline instead of separate stages.** A single listing of the source streams into a router that cuts batches as files are found. A pool of copiers takes batches as soon as they appear, and a checker reads copied files back from the destination while later batches are still copying. Copying starts within moments (the first batches are small), instead of after both drives have been listed in full.
+- **Bounded queues with backpressure.** At most 4 batches wait for a copier and 16 for a checker. When the copiers are busy, the router and the listing wait. Memory stays small however big the job.
+- **The source is listed once.** The listing reads only the source; copiers skip what's already there. Files confirmed while copying are skipped by the final check.
+- **Progress tells found-so-far from final totals.** While the listing runs, the line shows "… found so far · STILL LISTING", with no percentage or time left. Once the listing ends, the totals are final. Files already confirmed are shown as "checked".
+- **Fallback built in.** If the listing is cut off (unplugged drive, error), what was copied is kept and the run finishes with the v12.3 engine: a full listing, then copying what's left. `--engine batch` (or `SMARTCOPY_ENGINE=batch`) uses that engine from the start. `--verify-only` and `--dry-run` use it too.
+- **Fix:** the final check now waits for an unplugged drive to come back instead of stopping with an error (both engines).
+- Unchanged: the copies are ordinary individual files; content checks and all recovery guarantees; all privacy rules (pipes and queues in memory, lists and batches in the run folder on the destination). The test suite now covers both engines.
+
 ## v12.3: Faster with many files; fixes to checking and resuming
 Measured results are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 - **Scales to millions of files.** File lists are sorted once and combined by merging, so smartcopy's own work grows in step with the number of files and its memory stays bounded. Before, the destination-only check re-read the whole hash list for every batch, the progress line re-read every batch log every second, and the hash list and report figures were built in memory.

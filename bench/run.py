@@ -9,7 +9,8 @@ Prints one JSON object:
   peak_tree_rss_mb  highest combined resident memory of the whole process tree (sampled 4x/s)
   peak_proc_rss_mb  largest single process (getrusage)
   first_transfer_s  time until the first file appears on the destination
-  copy_s            time from "STEP 2" to the next step (the main copy), when present
+  copy_s            time spent in the copy step ("Copy the files", or "List and copy the files")
+  to_final_pass_s   time until the final pass starts: listing and copying both done
   steps             seconds at which each STEP line appeared
   exit              exit code
 With --strace (a separate run; strace slows things down) it adds syscall counts:
@@ -111,8 +112,10 @@ res = {
 }
 ks = sorted(steps.items(), key=lambda kv: kv[1])
 for i, (k, v) in enumerate(ks):
-    if "Copy the files" in k:
+    if "copy the files" in k.lower():
         res["copy_s"] = round((ks[i + 1][1] if i + 1 < len(ks) else wall) - v, 2)
+    if "Final pass" in k:
+        res["to_final_pass_s"] = v          # listing + copying done (both engines)
 if straceout:
     c = {}
     for line in open(straceout):

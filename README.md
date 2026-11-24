@@ -16,6 +16,7 @@ sudo smartcopy "/Volumes/Archive" "/Volumes/Backup/Archive"
 - **Checks the result.** It compares fingerprints (xxh128 hashes) of every file on both drives, re-copies any file that doesn't match, then checks it again.
 - **Re-checks faster.** Each file's fingerprint is saved on the destination, so later checks only need to read the destination drive. Fingerprints are saved as the copy goes, so they survive an interruption.
 - **Handles millions of files.** Its own bookkeeping grows in step with the number of files, with bounded memory (measured up to 3 million files).
+- **Starts copying at once.** Listing, copying and checking run at the same time as one pipeline (the streaming engine): the first file is copied within moments, even on a drive with millions of files, and copied files are checked while later ones are still copying. See [docs/STREAMING.md](docs/STREAMING.md).
 - **Tunes its own speed.** On big jobs it measures copying 1 file at a time against 4 at a time, then uses the faster setting.
 - **Explains problems plainly.** It recognises about 17 kinds of problem, such as read errors, a full drive, missing permissions or file names a drive doesn't allow. For each it says which drive was involved, how to fix it and how to avoid it.
 - **Shows clear progress.** The work is shown as numbered steps, with one status line showing the time left and the expected finish time.
@@ -140,6 +141,7 @@ To resume after any interruption, run the same command again.
 | `--verify-only` | Only check an earlier copy; resumes if stopped |
 | `--stop DEST` | Stop a running copy cleanly |
 | `--jobs N` | Copy or check N files at once (default: tuned automatically) |
+| `--engine batch` | List everything first, then copy (the v12.3 engine). Default: `stream`, which lists and copies at the same time |
 | `--speed-test` | Measure both drives and explain what limits speed |
 | `--force` | Override the swapped-drives, Time Machine and startup-disk checks |
 | `MAX_STUCK=N` | Give up after N passes in a row with no progress (default 6) |
@@ -149,13 +151,16 @@ Exit codes: `0` finished, `1` stopped because of a problem the report explains, 
 ## What you see
 
 ```
-━━━━━━━━ STEP 2 of 4: Copy the files ━━━━━━━━
-  Copying 94574 files (215.8 GB) that are missing or changed. The first few
-  minutes measure which speed setting is fastest.
+━━━━━━━━ STEP 1 of 3: List and copy the files ━━━━━━━━
+  Listing the source and copying at the same time: copying starts as soon as
+  the first files are found, and totals keep growing until the listing is
+  done. Copied files are checked as they finish, by reading them back from the
+  destination.
   Next: a final pass for folders and links
 
+Copying · 12.4 GB of 31.0 GB found so far · 41230 files found · 180 MB/s · STILL LISTING
   Speed tuning: 1 at a time ran at 22 MB/s, 4 at a time at 27 MB/s — using 4 at a time from now on.
-Copying 49% · 106.8 GB of 215.8 GB · 23 MB/s · TIME LEFT: 1h 6m · FINISHES ≈ 13:05
+Copying 49% · 106.8 GB of 215.8 GB · 23 MB/s · 51200 checked · TIME LEFT: 1h 6m · FINISHES ≈ 13:05
 ```
 
 And at the end:
@@ -187,6 +192,7 @@ See [PRIVACY.md](PRIVACY.md). In short:
 - [`install.sh`](install.sh): installer and uninstaller
 - [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md): what to install, and the macOS tools it uses
 - [`docs/DESIGN.md`](docs/DESIGN.md): how it works and why
+- [`docs/STREAMING.md`](docs/STREAMING.md): the streaming engine (v13): one pipeline for listing, copying and checking
 - [`docs/PERFORMANCE.md`](docs/PERFORMANCE.md): measured speed, memory and work before and after v12.3, and how to reproduce them
 - [`tests/run.sh`](tests/run.sh) and [`bench/`](bench/README.md): automated tests (including the privacy rules) and benchmarks, run on Linux with stand-ins for the macOS tools
 - [`docs/CONVERSATION.md`](docs/CONVERSATION.md): how the tool was designed, one request at a time

@@ -1,5 +1,5 @@
 #!/bin/bash
-# smartcopy v12.3 — resumable, self-healing copy of a drive OR a folder on macOS, with checksum
+# smartcopy v13.0 — resumable, self-healing copy of a drive OR a folder on macOS, with checksum
 # verification and a plain-English report of every problem, with steps to fix and avoid it.
 #
 #   sudo smartcopy SOURCE DESTINATION                copy (asks to confirm the first time)
@@ -18,6 +18,7 @@
 #           --verify-only only run the checksum check on a finished copy (e.g. later, overnight)
 #           --jobs N      copy N files side by side (default: tuned automatically while copying)
 #           --force       override safety checks (swapped drives, Time Machine, whole boot disk)
+#           --engine batch  list everything first, then copy (default: stream — list and copy at once)
 # Resume:   run the exact same command again after any interruption, crash or reboot.
 # Privacy:  file names are never shown on screen or in the report. Where it matters which files
 #           are affected, the report gives a count and points to a private list in the log folder
@@ -32,7 +33,7 @@ set -u
 
 TAB="$(printf '\t')"
 ts()   { date '+%F %T'; }
-usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 # hk_v VAR KB: a size in KB as "12.3 GB", stored in VAR (pure shell: no subprocess)
 hk_v() {
   local _var="$1" k="${2:-0}" i=0 d=1 x
@@ -270,6 +271,56 @@ progress_count() {
     END { printf "%.0f %d\n", s, n }' "$@" 2>/dev/null | tail -1
 }
 
+# stream_route PLAN OTHER PREFIX < source listing (rsync -ii --out-format='%i %l %M %n' against an
+# empty folder, which streams as it goes). The router of the streaming engine: every file goes to the
+# plan, folders and links to OTHER, and files are cut into batches AS THEY ARE FOUND (PREFIX.0001 ...,
+# NUL-separated names). Each finished batch is announced on stdout as one fixed-size line
+# "B id files bytes found_files found_bytes" (padded to 400 bytes: written whole, and the pipe holds
+# only a few dozen, so a router that runs ahead of the copiers simply waits — backpressure). The
+# first batches are small so copying starts at once; they double up to 5000 files / 1 GB.
+# Ends with "S files bytes others hardlinks". Memory: a few counters.
+stream_route() {
+  LC_ALL=C awk -v plan="$1" -v other="$2" -v pre="$3" "$AWK_LIB"'
+    function lim_n(b,  x) { x = 100; while (--b > 0 && x < 5000) x *= 2; return x > 5000 ? 5000 : x }
+    function lim_b(b,  x) { x = 33554432; while (--b > 0 && x < 1073741824) x *= 2; return x > 1073741824 ? 1073741824 : x }
+    function say(t) { printf "%-400s\n", t; fflush() }
+    function cut() { if (!n) return; close(f); say(sprintf("B %d %d %.0f %d %.0f", b, n, acc, nf, nb)); n = 0; acc = 0 }
+    item($0, F, 0) {
+      t = substr(F["i"], 2, 1); c = substr(F["i"], 1, 1); nm = F["n"]
+      if (t == "f") {
+        if (c == "h") { nh++; print nm > other; next }          # hard link: made by the final pass
+        if (c != "." && c != ">") next
+        print nm "\t" F["l"] "\t" F["m"] "\tT" > plan
+        nf++; nb += F["l"]
+        if (n == 0) { b++; f = sprintf("%s.%04d", pre, b) }
+        printf "%s%c", unesc(nm), 0 > f; n++; acc += F["l"]
+        if (n >= lim_n(b) || acc >= lim_b(b)) cut()
+      } else {
+        if (nm == "./") nm = "."; else sub(/\/$/, "", nm)
+        print nm > other; no++
+      }
+    }
+    END { cut(); close(plan); close(other); say(sprintf("S %d %.0f %d %d", nf, nb, no, nh)) }'
+}
+
+# harvest_stream WORKER_OUTPUT JOURNAL BATCH_RECORDS LOG: one finished streaming copy batch, read once.
+# Copied files' fingerprints -> journal and BATCH_RECORDS (for checking them straight away), changed
+# items -> LOG. Prints "copied_bytes copied_files processed_bytes processed_files".
+harvest_stream() {
+  [ -f "$1" ] || { echo "0 0 0 0"; return; }
+  : > "$3"
+  LC_ALL=C awk -v j="$2" -v rec="$3" -v lo="$4" "$AWK_LIB"'
+    item($0, F, 1) {
+      if (substr(F["i"], 2, 1) == "f") { pn++; pb += F["l"] }
+      if (substr(F["i"], 1, 1) != ".") print $0 >> lo
+      if (substr(F["i"], 1, 2) == ">f") {
+        n++; b += F["l"]
+        if (F["c"] != "") { r = F["n"] "\t" F["l"] "\t" F["m"] "\t" F["c"]; print r >> j; print r > rec }
+      }
+    }
+    END { printf "%.0f %d %.0f %d\n", b, n, pb, pn }' "$1" 2>/dev/null | tail -1
+}
+
 # copy_stats LOG: "files bytes copied_twice" — each copied file counted once
 copy_stats() {
   ( set -o pipefail
@@ -298,6 +349,7 @@ MAX_STUCK="${MAX_STUCK:-6}"
 MAX_PASSES="${MAX_PASSES:-500}"
 VERIFY="${VERIFY:-1}"
 YES=0; DETACH=0; FORCE=0; DRYRUN=0; STOP=0; VERIFY_ONLY=0; SPEEDTEST=0; JOBS="${JOBS:-auto}"
+ENGINE="${SMARTCOPY_ENGINE:-stream}"   # stream (lists and copies at the same time) or batch (v12.3: list, then copy)
 POS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -309,6 +361,8 @@ while [ $# -gt 0 ]; do
     --speed-test)    SPEEDTEST=1 ;;
     --jobs)          shift; JOBS="${1:-}" ;;
     --jobs=*)        JOBS="${1#--jobs=}" ;;
+    --engine)        shift; ENGINE="${1:-}" ;;
+    --engine=*)      ENGINE="${1#--engine=}" ;;
     --force)         FORCE=1 ;;
     --stop)          STOP=1 ;;
     -h|--help)       usage 0 ;;
@@ -335,6 +389,7 @@ fatal() {
   exit 1
 }
 
+case "$ENGINE" in stream|batch) ;; *) fatal "--engine must be stream or batch" ;; esac
 [ "$(id -u)" -eq 0 ] || fatal "Please run this with sudo." "" "Put sudo in front of the command, e.g.: sudo $0 SOURCE DESTINATION"
 
 # ---------------- Path helpers ----------------
@@ -988,6 +1043,7 @@ cleanup() {
     done
     [ "$other" -eq 0 ] && mdutil -i on "$DST_VOL" >/dev/null 2>&1 && rm -f "$SPOT_NOTE"
   fi
+  [ "$STARTED" -eq 1 ] && kill_tree $$       # listing, copiers, checkers: stop them before tidying up
   if [ "$STARTED" -eq 1 ] && [ "$DRYRUN" -eq 0 ]; then
     harvest_unfinished
     save_fingerprints || echo "  (Couldn't update the fingerprint list now; the next run will.)"
@@ -1326,7 +1382,7 @@ if [ "$DETACH" -eq 1 ] && [ -z "${SMARTCOPY_CHILD:-}" ]; then
   CONSOLE="$LOGDIR/console-$STAMP.log"
   args=(--yes); [ "$VERIFY" = "0" ] && args+=(--no-verify); [ "$FORCE" -eq 1 ] && args+=(--force)
   [ "$VERIFY_ONLY" -eq 1 ] && args+=(--verify-only)
-  args+=(--jobs "$JOBS_ARG")
+  args+=(--jobs "$JOBS_ARG" --engine "$ENGINE")
   SMARTCOPY_CHILD=1 SMARTCOPY_FIRST_RUN="$first_run" SMARTCOPY_PREV_UNFINISHED="$PREV_UNFINISHED" nohup /bin/bash "$SELF" "${args[@]}" "$SRC" "$DST" > "$CONSOLE" 2>&1 < /dev/null &
   REPORT_ON=0
   echo "Copy is running in the background (PID $!). You can close Terminal."
@@ -1528,11 +1584,13 @@ est_finish() {  # est_finish SECONDS_LEFT -> smoothed seconds left in EST_LEFT
 # One clearly labelled status line, refreshed every second (no subprocesses except a rare date/tput)
 COLS=0; COLS_AT=-100
 progress_line() {   # progress_line LABEL DONE_BYTES TOTAL_BYTES DONE_FILES TOTAL_FILES
-  local label="$1" db="$2" tb="$3" df="$4" tf="$5" pct el bps left="estimating…" when="" secs vsecs f1 f2 h1 h2
+  local label="$1" db="$2" tb="$3" df="$4" tf="$5" pct el bps left="estimating…" when="" secs vsecs f1 f2 h1 h2 listing="${LISTING:-0}"
   el=$(( SECONDS - PHASE_T0 )); [ "$el" -gt 0 ] || el=1
   bps=$(( (db - ${PHASE_B0:-0}) / el )); [ "$bps" -ge 0 ] || bps=0
   pct=100; [ "$tb" -gt 0 ] && pct=$(( db * 100 / tb ))
-  if [ "${TUNING:-0}" -eq 1 ]; then
+  if [ "$listing" -eq 1 ]; then
+    left="once the listing is done"
+  elif [ "${TUNING:-0}" -eq 1 ]; then
     left="measuring speed (first ~5 min)"
   elif [ "$EST_RATE" -gt 0 ]; then
     secs=$(( EST_RATE > 0 ? ( (tb > db ? tb - db : 0) + (tf > df ? tf - df : 0) * PER_FILE ) / EST_RATE : 0 ))
@@ -1553,6 +1611,11 @@ progress_line() {   # progress_line LABEL DONE_BYTES TOTAL_BYTES DONE_FILES TOTA
   tail=" · TIME LEFT: $left${when:+ · FINISHES ≈ $when}"
   hk_v h1 $(( db / 1024 )); hk_v h2 $(( tb / 1024 ))
   extras=( " · $h1 of $h2" " · $fl files left" " · $(( bps / 1000000 )) MB/s" )
+  if [ "$listing" -eq 1 ]; then               # totals still growing: say so, and show no percentage or time left
+    head="$label"; tail=" · STILL LISTING"
+    extras=( " · $h1 of $h2 found so far" " · $tf files found" " · $(( bps / 1000000 )) MB/s" )
+  fi
+  [ "${STREAM_CHECKED:-0}" -gt 0 ] && extras+=( " · $STREAM_CHECKED checked" )
   if [ $(( SECONDS - COLS_AT )) -ge 15 ]; then COLS=$(tput cols 2>/dev/null); COLS_AT=$SECONDS; fi
   local cols="$COLS"; [ "${cols:-0}" -ge 40 ] 2>/dev/null || cols=200
   line="$head"
@@ -1741,8 +1804,11 @@ batch_copy() {
   [ "$TODO_FILES" -gt 0 ] || return 0
   COPY_DELTA=--whole-file
   [ "${WRITE_MODE[0]}" != --inplace ] && [ "$PREV_UNFINISHED" -eq 1 ] && COPY_DELTA=--no-whole-file
-  make_batches "$PLAN" "$pre" copy "$TODO_BYTES" || fatal "Couldn't write the file list on the destination drive." \
-    "The drive may be full or was disconnected." "Free some space or reconnect the drive, then run the same command again." "" DESTINATION
+  until make_batches "$PLAN" "$pre" copy "$TODO_BYTES"; do
+    drives_here && fatal "Couldn't write the file list on the destination drive." \
+      "The drive may be full." "Free some space on the destination, then run the same command again." "" DESTINATION
+    wait_for_mounts
+  done
   local b0=$COPIED_BYTES
   t0=$SECONDS
   run_batches copy "$pre" "$TODO_BYTES" "$TODO_FILES"
@@ -1751,6 +1817,176 @@ batch_copy() {
   [ "$BATCH_FAILED" -eq 1 ] && PREV_UNFINISHED=1     # half-written files possible: the final pass resumes them
   COPY_BATCH_FAILED=$BATCH_FAILED
   rm -f "$pre".*
+}
+
+# ============================ Streaming engine ============================
+# One continuous pipeline instead of "list everything, then copy, then check":
+#
+#   listing (rsync, source only) ─▶ router (awk) ─▶ [batch queue] ─▶ copiers (K rsyncs) ─▶ [check queue] ─▶ checkers
+#                                     │ plan, folders/links                │ fingerprints → journal
+#
+# • The listing reads only the source (against an empty folder, so it streams folder by folder) and
+#   is done once. The router writes the plan (for the final check) and cuts batches as files appear;
+#   the first batches are small, so the first file is copied within moments.
+# • Queues are bounded: the batch queue holds STREAM_QMAX batches in memory, the pipe from the router
+#   a few dozen fixed-size announcements; when the copiers are busy, the router and the listing wait
+#   (backpressure). The check queue holds STREAM_VQMAX batches; beyond that, batches are left for the
+#   final check instead of slowing the copy down.
+# • Copiers and checkers are pools of slots: any free slot takes the next batch (dynamic distribution).
+#   Each copier reports every file it looked at (-ii), so progress counts files already up to date too.
+# • Checkers read back the files a batch just copied (destination only) and compare them with the
+#   fingerprints taken while copying; confirmed files go in the checkpoint, so the final check skips
+#   them. Everything else (files copied earlier, batches not checked in time) is checked at the end.
+# • Folders get their dates and permissions in the final pass, after their contents are written;
+#   links and hard links are made there too (hard links by a full pass with -H).
+# • If the listing is cut off (a drive unplugged, an error), what was copied is kept and the run
+#   carries on with the batch engine: a full listing of both drives, then copying what's left.
+# All lists and batches live in the run folder on the destination; the queues themselves are in memory.
+STREAM_QMAX=4; STREAM_VQMAX=16; STREAM_CHECKERS=1
+DISC_META=("${META[@]}"); DISC_META[0]="${META[0]//[AXN]/}"   # listing: no ACLs/xattrs/creation dates needed
+stream_producer() {
+  "$RSYNC" "${DISC_META[@]}" --dry-run -ii --out-format='%i %l %M %n' "${EXCLUDES[@]}" "$SRC/" "$STREAM_EMPTY/" 2> "$RUNDIR/scan.err" \
+    | stream_route "$RUNDIR/plan.raw" "$PLAN_OTHER" "$RUNDIR/c"
+  local st=("${PIPESTATUS[@]}")
+  printf 'E %s %s\n' "${st[0]}" "${st[1]}"
+}
+stream_copy() {
+  local pre="$RUNDIR/c" k="$JOBS" slot pid rc b f r kind a1 a2 a3 a4 a5 eof=0 instant=0 before running vrunning nd
+  local cb cf xb xf fin_b=0 fin_f=0 done_b done_f copy_done=0 last_prog=-1 t_start=$SECONDS warned=0 free_k sort_pid=""
+  local cal=0 stage=0 tune0=0 el work t1 w1 m1 t2 w2 m2 t3 w3 m3 ra rb tb
+  local -a PIDS=() BATCH=() VPIDS=() VBATCH=() Q=() VQ=() live=()
+  STREAM_OK=0; STREAM_CHECKED=0; DISC_FILES=0; DISC_BYTES=0; DRC=""; DARC=""; COPY_BATCH_FAILED=0
+  ALL_FILES=0; ALL_BYTES=0; N_OTHER=0; N_HLINKS=0; NB=0; BSIZE=(); BCOUNT=(); LISTING=1
+  PLAN_OTHER="$RUNDIR/plan.other"; : > "$RUNDIR/plan.raw"; : > "$PLAN_OTHER"
+  STREAM_EMPTY=$(mktemp -d "$RUNDIR/empty.XXXXXX")
+  COPY_DELTA=--whole-file
+  [ "${WRITE_MODE[0]}" != --inplace ] && [ "$PREV_UNFINISHED" -eq 1 ] && COPY_DELTA=--no-whole-file
+  rm -f "$VSTATE"          # this run copies: an earlier stopped check no longer applies; this run records its own
+  free_k=$(df -kP "$DST_VOL" | tail -1 | awk '{print $4}')
+  wait_for_mounts
+  exec 3< <(stream_producer)
+  PHASE_T0=$SECONDS; PHASE_B0=0; LAST_NL=$SECONDS; est_reset
+  while :; do
+    # --- finished copiers: read each batch's output once; queue its copied files for checking
+    running=0; live=()
+    for slot in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+      pid="${PIDS[slot]:-}"; [ -n "$pid" ] || continue
+      printf -v f '%s.%04d' "$pre" "${BATCH[slot]}"
+      if kill -0 "$pid" 2>/dev/null; then running=$(( running + 1 )); live+=("$f.log"); continue; fi
+      wait "$pid"; rc=$?; b="${BATCH[slot]}"; PIDS[slot]=""
+      case $rc in 0|24) ;; *) COPY_BATCH_FAILED=1 ;; esac
+      words "$(harvest_stream "$f.log" "$JOURNAL" "$f.rec" "$LOG")" cb cf xb xf
+      COPIED_BYTES=$(( COPIED_BYTES + cb )); COPIED_FILES=$(( COPIED_FILES + cf ))
+      fin_b=$(( fin_b + xb )); fin_f=$(( fin_f + xf ))
+      cat "$f.err" 2>/dev/null >> "$ALLERR"; rm -f "$f" "$f.log" "$f.err"
+      if [ "$VERIFY" != 0 ] && [ -s "$f.rec" ] && [ ${#VQ[@]} -lt "$STREAM_VQMAX" ] && { [ "$rc" -eq 0 ] || [ "$rc" -eq 23 ] || [ "$rc" -eq 24 ]; }; then
+        VQ+=("$b")
+      else rm -f "$f.rec"; fi                                    # checked in the final check instead
+    done
+    # --- finished checkers
+    vrunning=0
+    for slot in 1 2 3 4; do
+      pid="${VPIDS[slot]:-}"; [ -n "$pid" ] || continue
+      if kill -0 "$pid" 2>/dev/null; then vrunning=$(( vrunning + 1 )); continue; fi
+      wait "$pid"; rc=$?; printf -v f '%s.%04d' "$pre" "${VBATCH[slot]}"; VPIDS[slot]=""
+      words "$(finish_hash "$f.rec" "$f.vout" "$RUNDIR/stream.diffs")" xb xf nd
+      if { [ "$rc" -eq 0 ] || [ "$rc" -eq 24 ]; } && [ "$nd" -eq 0 ]; then
+        cut -f1-3 "$f.rec" 2>/dev/null >> "$VSTATE"; STREAM_CHECKED=$(( STREAM_CHECKED + xf ))
+      fi                                                         # otherwise the final check repeats it
+      rm -f "$f.rec" "$f.v0" "$f.vout" "$f.verr"
+    done
+    [ "$eof" -eq 1 ] && [ ${#Q[@]} -eq 0 ] && [ "$running" -eq 0 ] && copy_done=1
+    [ "$copy_done" -eq 1 ] && [ "$vrunning" -eq 0 ] && break
+    # --- start checkers (destination only: read the files back, compare with the fingerprints)
+    while [ "$copy_done" -eq 0 ] && [ "$vrunning" -lt "$STREAM_CHECKERS" ] && [ ${#VQ[@]} -gt 0 ]; do
+      b="${VQ[0]}"; VQ=(${VQ[@]+"${VQ[@]:1}"}); printf -v f '%s.%04d' "$pre" "$b"
+      for slot in 1 2 3 4; do [ -z "${VPIDS[slot]:-}" ] && break; done
+      nul_list < "$f.rec" > "$f.v0"
+      in_dst "$RSYNC" -r -8 --checksum "${CSUM[@]}" --dry-run -i "--out-format=$FMT" \
+        --from0 --files-from="$f.v0" ./ "$STREAM_EMPTY/" > "$f.vout" 2> "$f.verr" &
+      VPIDS[slot]=$!; VBATCH[slot]=$b; vrunning=$(( vrunning + 1 ))
+    done
+    # --- speed tuning, once the job is known to be big: 1 at a time against 4 at a time
+    if [ "$AUTO_TUNE" -eq 1 ] && [ "$cal" -eq 0 ] && [ "$stage" -eq 0 ] && [ -z "${TUNED_copy:-}" ] \
+       && [ "${DISC_BYTES%%.*}" -ge 21474836480 ] && [ "$DISC_FILES" -ge 2000 ]; then
+      cal=1; k=1; tune0=$SECONDS
+    fi
+    if [ "$cal" -eq 1 ]; then
+      el=$(( SECONDS - tune0 )); r=$(dst_used_k); r=$(( ${r:-0} * 1024 )); work=$(( r + fin_f * 262144 ))
+      case $stage in
+        0) if [ "$el" -ge 20 ];  then t1=$el; w1=$work; m1=$r; stage=1; fi ;;
+        1) if [ "$el" -ge 120 ]; then t2=$el; w2=$work; m2=$r; k=4; stage=2; fi ;;
+        2) if [ "$el" -ge 140 ]; then t3=$el; w3=$work; m3=$r; stage=3; fi ;;
+        3) if [ "$el" -ge 240 ]; then
+             ra=$(( (w2 - w1) / (t2 - t1) )); rb=$(( (work - w3) / (el - t3) ))
+             if [ "$rb" -gt $(( ra * 12 / 10 )) ]; then k=4; else k=1; fi
+             TUNED_copy=$k; printf '\r\033[K'
+             echo "  Speed tuning: 1 at a time ran at $(( (m2 - m1) / (t2 - t1) / 1000000 )) MB/s, 4 at a time at $(( (r - m3) / (el - t3) / 1000000 )) MB/s — using $k at a time from now on."
+             stage=4; cal=0
+           fi ;;
+      esac
+    fi
+    # --- start copiers on queued batches
+    while [ "$running" -lt "$k" ] && [ ${#Q[@]} -gt 0 ]; do
+      if ! is_mounted "$SRC_VOL" || ! is_mounted "$DST_VOL"; then printf '\n'; wait_for_mounts; fi
+      b="${Q[0]}"; Q=(${Q[@]+"${Q[@]:1}"}); printf -v f '%s.%04d' "$pre" "$b"
+      for slot in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do [ -z "${PIDS[slot]:-}" ] && break; done
+      in_dst "$RSYNC" "${META[@]}" -r -ii "--out-format=$FMT" "${CSUM[@]}" "${WRITE_MODE[@]}" "$COPY_DELTA" \
+        "${EXCLUDES[@]}" --from0 --files-from="$f" "$SRC/" ./ > "$f.log" 2> "$f.err" &
+      PIDS[slot]=$!; BATCH[slot]=$b; running=$(( running + 1 ))
+    done
+    # --- take announcements from the router while there's room in the queue (this read is also the
+    #     loop's one-second tick; a full queue leaves the router waiting)
+    if [ "$eof" -eq 0 ] && [ ${#Q[@]} -lt "$STREAM_QMAX" ]; then
+      before=$SECONDS
+      if IFS=' ' read -r -t 1 -u 3 kind a1 a2 a3 a4 a5; then
+        instant=0
+        case "$kind" in
+          B) Q+=("$a1"); BCOUNT[a1]=$a2; BSIZE[a1]=$a3; NB=$a1; DISC_FILES=$a4; DISC_BYTES=$a5 ;;
+          S) ALL_FILES=$a1; ALL_BYTES=$a2; N_OTHER=$a3; N_HLINKS=$a4; DISC_FILES=$a1; DISC_BYTES=$a2 ;;
+          E) eof=1; DRC=$a1; DARC=$a2; LISTING=0
+             if { [ "$DRC" = 0 ] || [ "$DRC" = 24 ]; } && [ "$DARC" = 0 ]; then   # sort the plan while copying goes on
+               csort -k1,1 "$RUNDIR/plan.raw" > "$RUNDIR/plan" & sort_pid=$!
+             fi ;;
+        esac
+      elif [ "$SECONDS" -eq "$before" ]; then                  # no wait at all: the router's pipe closed
+        instant=$(( instant + 1 )); [ "$instant" -ge 3 ] && { eof=1; LISTING=0; DRC=${DRC:-255}; }
+        sleep 1
+      fi
+    else
+      sleep 1
+    fi
+    # --- the destination may not hold everything (first copy of a folder)
+    if [ "$warned" -eq 0 ] && [ "$first_run" -eq 1 ] && [ "$SRC_VOL" != "$SRC" ] && [ $(( ${DISC_BYTES%%.*} / 1024 )) -gt "${free_k:-0}" ] 2>/dev/null; then
+      warned=1; printf '\r\033[K'
+      add_issue PROBLEM DESTINATION "The source ($(hk $(( ${DISC_BYTES%%.*} / 1024 ))) found so far) may not fit in the free space on the destination ($(hk "$free_k"))" \
+"The destination will fill up before the copy finishes." \
+"Free up space on $DST_VOL, use a bigger drive, or copy a smaller folder." \
+"Check sizes before starting; --dry-run shows how much would be copied."
+      echo "WARNING: the source ($(hk $(( ${DISC_BYTES%%.*} / 1024 ))) found so far) may not fit in the destination's free space ($(hk "$free_k"))."
+    fi
+    # --- progress, once a second: done = files looked at (copied or already there), of those found
+    if [ "$SECONDS" -ne "$last_prog" ]; then
+      last_prog=$SECONDS; done_b=$fin_b; done_f=$fin_f
+      if [ "$running" -gt 0 ]; then
+        words "$(progress_count check "${live[@]}")" xb xf; done_b=$(( done_b + xb )); done_f=$(( done_f + xf ))
+      fi
+      est_add "$done_b" "$done_f"; TUNING=$cal; tb="${DISC_BYTES%%.*}"
+      progress_line "Copying" "$done_b" "$tb" "$done_f" "$DISC_FILES"
+    fi
+  done
+  exec 3<&-
+  echo
+  for b in ${VQ[@]+"${VQ[@]}"}; do printf -v f '%s.%04d' "$pre" "$b"; rm -f "$f.rec"; done   # left for the final check
+  rm -rf "$STREAM_EMPTY"
+  BATCH_SECS=$(( SECONDS - t_start )); [ "$BATCH_SECS" -gt 0 ] || BATCH_SECS=1; BATCH_BYTES=$COPIED_BYTES
+  COPY_SECS=$(( COPY_SECS + BATCH_SECS ))
+  cat "$RUNDIR/scan.err" 2>/dev/null >> "$ALLERR"
+  [ "$COPY_BATCH_FAILED" -eq 1 ] && PREV_UNFINISHED=1
+  if [ -n "$sort_pid" ] && wait "$sort_pid" && drives_here; then
+    STREAM_OK=1; PLAN_COMPLETE=1; PLAN="$RUNDIR/plan"; rm -f "$RUNDIR/plan.raw"
+    TODO_FILES=0; TODO_BYTES=0                 # (the space check already ran while listing)
+  fi
 }
 
 # ---------------- Hash list (fingerprints of the source files, kept on the destination) ----------------
@@ -1762,6 +1998,7 @@ batch_copy() {
 verify() {
   local list="$1" how="$2" pre="$RUNDIR/v" hpre="$RUNDIR/h" hc="$RUNDIR/hc" full="$RUNDIR/full"
   local vs="" man="" cj="" sel skipped=0 hn=0 hb=0 vf=0 vb=0 b f rc r j=() x
+  wait_for_mounts
   : > "$VERIFYLOG"; vrc=0
   if [ "$how" = select ]; then
     for x in "$JPREFIX".new-*; do [ -s "$x" ] && j+=("$x"); done
@@ -1773,11 +2010,13 @@ verify() {
       vs="$RUNDIR/checkpoint"
       ( set -o pipefail; LC_ALL=C awk -F'\t' 'NF == 3 { print $0 "\tV" }' "$VSTATE" | csort -k1,1 > "$vs" ) || vs=""
     fi
-    sel=$(select_checks "$list" "$man" "$cj" "$vs" "$hc" "$full") || \
-      fatal "Couldn't work out which files to check." "Writing the check list on the destination drive failed — it may be full or was disconnected." \
-        "Free some space or reconnect the drive, then run the same command again." "" DESTINATION
+    until sel=$(select_checks "$list" "$man" "$cj" "$vs" "$hc" "$full"); do   # a drive went away: wait, try again
+      drives_here && fatal "Couldn't work out which files to check." "Writing the check list on the destination drive failed — it may be full." \
+        "Free some space on the destination, then run the same command again." "" DESTINATION
+      printf '\n'; wait_for_mounts
+    done
     words "$sel" skipped hn hb vf vb
-    [ "$skipped" -gt 0 ] && done_msg "$skipped files were already checked in an earlier run — skipping those."
+    [ "$skipped" -gt 0 ] && done_msg "$skipped files were already checked (as they were copied, or by a check that was stopped) — skipping those."
   else
     cp "$list" "$full"; : > "$hc"
     words "$(LC_ALL=C awk -F'\t' '{ s += $2 } END { printf "%d %.0f\n", NR, s }' "$full")" vf vb
@@ -1786,8 +2025,11 @@ verify() {
   if [ "$hn" -gt 0 ]; then
     done_msg "$hn files ($(hk $(( ${hb%%.*} / 1024 )))) have saved fingerprints — checking those by reading only the destination drive."
     EMPTY_DIR=$(mktemp -d "$RUNDIR/empty.XXXXXX")
-    make_batches "$hc" "$hpre" hash "$hb" || fatal "Couldn't write the file list on the destination drive." \
-      "The drive may be full or was disconnected." "Free some space or reconnect the drive, then run the same command again." "" DESTINATION
+    until make_batches "$hc" "$hpre" hash "$hb"; do
+      drives_here && fatal "Couldn't write the file list on the destination drive." \
+        "The drive may be full." "Free some space on the destination, then run the same command again." "" DESTINATION
+      wait_for_mounts
+    done
     run_batches hash "$hpre" "$hb" "$hn"
     for b in $RETRY_BATCHES; do         # batches that couldn't be read are checked the full way instead
       printf -v f '%s.%04d' "$hpre" "$b"
@@ -1799,8 +2041,11 @@ verify() {
   fi
   FULL_CHECKED=$(( FULL_CHECKED + vf ))
   if [ "$vf" -gt 0 ]; then
-    make_batches "$full" "$pre" check "$vb" || fatal "Couldn't write the file list on the destination drive." \
-      "The drive may be full or was disconnected." "Free some space or reconnect the drive, then run the same command again." "" DESTINATION
+    until make_batches "$full" "$pre" check "$vb"; do
+      drives_here && fatal "Couldn't write the file list on the destination drive." \
+        "The drive may be full." "Free some space on the destination, then run the same command again." "" DESTINATION
+      wait_for_mounts
+    done
     run_batches verify "$pre" "$vb" "$vf"
     for b in $RETRY_BATCHES; do         # batches cut off by a drive dropping out: once more
       printf -v f '%s.%04d' "$pre" "$b"; wait_for_mounts
@@ -1826,15 +2071,41 @@ verify() {
 # ============================ Main ============================
 PERSISTENT=0; COPY_BATCH_FAILED=0
 HASH_CHECKED=0; FULL_CHECKED=0
-if [ "$VERIFY_ONLY" -eq 1 ]; then STEP_TOTAL=2; elif [ "$VERIFY" = 0 ]; then STEP_TOTAL=3; else STEP_TOTAL=4; fi
+[ "$VERIFY_ONLY" -eq 1 ] && ENGINE=batch          # checking an existing copy: the batch engine
+if [ "$VERIFY_ONLY" -eq 1 ]; then STEP_TOTAL=2
+elif [ "$ENGINE" = stream ]; then STEP_TOTAL=3; [ "$VERIFY" = 0 ] && STEP_TOTAL=2
+elif [ "$VERIFY" = 0 ]; then STEP_TOTAL=3; else STEP_TOTAL=4; fi
+STREAM_OK=0; STREAM_CHECKED=0
 if [ "$VERIFY_ONLY" -eq 1 ]; then
   step "List the files" "Making a list of every file on both drives, so the check knows exactly how much there is." "check every file's contents"
+  plan_scan; post_scan_checks
+elif [ "$ENGINE" = stream ]; then
+  step "List and copy the files" "Listing the source and copying at the same time: copying starts as soon as the first files are found, and totals keep growing until the listing is done.$([ "$VERIFY" != 0 ] && echo " Copied files are checked as they finish, by reading them back from the destination.")" "a final pass for folders and links"
+  stream_copy
+  if [ "$STREAM_OK" -eq 1 ]; then
+    done_msg "Found $ALL_FILES files ($(hk $(( ${ALL_BYTES%%.*} / 1024 )))) on the source; copied $COPIED_FILES.$([ "$STREAM_CHECKED" -gt 0 ] && echo " $STREAM_CHECKED already checked.")"
+    post_scan_checks
+  else
+    STREAM_FAILED=$COPY_BATCH_FAILED
+    done_msg "The listing was cut off — what was copied is kept. Finishing with a full listing of both drives."
+    plan_scan; post_scan_checks
+    if [ "$TODO_FILES" -gt 0 ]; then batch_copy; done_msg "Copied $TODO_FILES more files."; fi
+    [ "$STREAM_FAILED" -eq 1 ] && COPY_BATCH_FAILED=1
+  fi
+  HASH_CHECKED=$(( HASH_CHECKED + STREAM_CHECKED ))
+  # Safety net: whatever happened above, never go on without a complete file list
+  if [ -z "$PLAN" ] || [ ! -f "$PLAN" ]; then
+    done_msg "Making a full list of both drives."
+    plan_scan; post_scan_checks
+    if [ "$TODO_FILES" -gt 0 ]; then batch_copy; fi
+    COPY_BATCH_FAILED=1
+  fi
 else
   step "List the files" "Comparing both drives to see what's already copied and what isn't." "copy what's missing"
+  plan_scan; post_scan_checks
 fi
-plan_scan
-post_scan_checks
-if [ "$VERIFY_ONLY" -eq 0 ]; then
+if [ "$VERIFY_ONLY" -eq 0 ] && [ "$ENGINE" = stream ]; then :
+elif [ "$VERIFY_ONLY" -eq 0 ]; then
   if [ "$TODO_FILES" -gt 0 ]; then
     step "Copy the files" "Copying $TODO_FILES files ($(hk $(( TODO_BYTES / 1024 )))) that are missing or changed. The first few minutes measure which speed setting is fastest." "a final pass for folders and links"
     batch_copy
@@ -1842,6 +2113,9 @@ if [ "$VERIFY_ONLY" -eq 0 ]; then
   else
     step "Copy the files" "Nothing to copy — everything is already on the destination." "a final pass for folders and links"
   fi
+fi
+if [ "$VERIFY_ONLY" -eq 0 ]; then
+  FINAL_C0=$COPIED_FILES
   # The final pass only needs the folders and links when every file was copied cleanly and the final
   # check will run anyway; otherwise (or with hard links) it goes through everything, as a safety net.
   if [ "$VERIFY" != 0 ] && [ "$COPY_BATCH_FAILED" -eq 0 ] && [ "${N_HLINKS:-0}" -eq 0 ] && [ -s "$PLAN_OTHER" ]; then
@@ -1856,8 +2130,10 @@ if [ "$VERIFY_ONLY" -eq 0 ]; then
       "$([ "$VERIFY" = 0 ] && echo "the report" || echo "check every file's contents against the source")"
     copy_loop "Final pass" || PERSISTENT=1
   fi
-  # files changed: earlier check results no longer apply
-  { [ "$TODO_FILES" -gt 0 ] || [ "$COPIED_FILES" -gt 0 ]; } && rm -f "$VSTATE"
+  # files changed: earlier check results no longer apply (the streaming engine keeps what it checked
+  # itself, unless the final pass copied files again)
+  if [ "$ENGINE" = stream ]; then [ "$COPIED_FILES" -gt "$FINAL_C0" ] && rm -f "$VSTATE"
+  else { [ "$TODO_FILES" -gt 0 ] || [ "$COPIED_FILES" -gt 0 ]; } && rm -f "$VSTATE"; fi
   done_msg "Final pass done."
 fi
 
