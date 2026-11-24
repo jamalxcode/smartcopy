@@ -1,5 +1,11 @@
 # Changelog
 
+## v12.2: Installer
+- `install.sh` installs `smartcopy` into `/usr/local/bin` with its man page, updates in place and uninstalls with `--uninstall`. It also checks for rsync, removes the download flag and removes the old safe-copy man page.
+- Run it from anywhere as `sudo smartcopy …`; the docs and examples now use that form.
+- `--help` shows the full summary, including `--verify-only`.
+- Docs: update, uninstall and moving from safe-copy, including waiting for running old-version copies.
+
 ## v12.1: Renamed to smartcopy
 - The script is now `smartcopy.sh` and the manual is `man smartcopy`; marker and hash files are now `.smartcopy-target` and `.smartcopy-hashes`.
 - Copies made under the old name (`.safe-copy-…` files) are adopted automatically, so resuming and the hash list keep working.

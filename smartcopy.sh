@@ -1,15 +1,16 @@
 #!/bin/bash
-# smartcopy.sh v12.1 — resumable, self-healing copy of a drive OR a folder on macOS, with checksum
+# smartcopy v12.2 — resumable, self-healing copy of a drive OR a folder on macOS, with checksum
 # verification and a plain-English report of every problem, with steps to fix and avoid it.
 #
-#   sudo ./smartcopy.sh SOURCE DESTINATION                copy (asks to confirm the first time)
-#   sudo ./smartcopy.sh --background SOURCE DESTINATION   keeps running if Terminal closes
-#   sudo ./smartcopy.sh --dry-run SOURCE DESTINATION      preview what would be copied
-#   sudo ./smartcopy.sh --stop DESTINATION                stop a running copy cleanly
-#   sudo ./smartcopy.sh --speed-test SOURCE DESTINATION   measure both drives and say what limits speed
+#   sudo smartcopy SOURCE DESTINATION                copy (asks to confirm the first time)
+#   sudo smartcopy --background SOURCE DESTINATION   keeps running if Terminal closes
+#   sudo smartcopy --dry-run SOURCE DESTINATION      preview what would be copied
+#   sudo smartcopy --verify-only SOURCE DESTINATION  only check an earlier copy (resumes if stopped)
+#   sudo smartcopy --stop DESTINATION                stop a running copy cleanly
+#   sudo smartcopy --speed-test SOURCE DESTINATION   measure both drives and say what limits speed
 #
 # SOURCE and DESTINATION can be whole drives or folders on any drive, for example:
-#   sudo ./smartcopy.sh "/Volumes/Photos SSD/2024" "/Volumes/Backup/Photos/2024"
+#   sudo smartcopy "/Volumes/Photos SSD/2024" "/Volumes/Backup/Photos/2024"
 # Everything INSIDE the source goes INTO the destination folder (created if it doesn't exist).
 #
 # Options:  -y, --yes     skip the first-run confirmation
@@ -19,8 +20,8 @@
 #           --force       override safety checks (swapped drives, Time Machine, whole boot disk)
 # Resume:   run the exact same command again after any interruption, crash or reboot.
 # Privacy:  file names are never shown on screen or in the report. Where it matters which files
-#           are affected, the report gives a count and points to a private list that only your
-#           Mac account can open (the log folder is locked to you).
+#           are affected, the report gives a count and points to a private list in the log folder
+#           (hidden; locked to your account on APFS drives).
 # Storage:  everything this script writes (logs, report, file lists, resume state, locks, temporary
 #           files) goes in a hidden "rsync-logs" folder on the DESTINATION drive — nothing is ever
 #           written to the Mac's own drive or to the source drive.
@@ -30,7 +31,7 @@
 set -u
 
 ts()   { date '+%F %T'; }
-usage() { sed -n '3,21p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 hk()   { awk -v k="${1:-0}" 'BEGIN{split("KB MB GB TB PB",u);i=1;while(k>=1024&&i<5){k/=1024;i++};printf "%.1f %s",k,u[i]}'; }
 # Word-wrap stdin: wrap FIRST_INDENT REST_INDENT
 wrap() {

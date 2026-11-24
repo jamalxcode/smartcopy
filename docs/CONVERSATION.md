@@ -92,6 +92,11 @@ Any hash has to read every byte, so hashing alone doesn't skip reading. Saving t
 - The project renamed to **smartcopy** (**v12.1**). Copies made under the old name are adopted automatically.
 - A README, a privacy document, design notes, this summary and an MIT licence.
 
+## 16. Installing it properly
+"smartcopy is in Downloads, give me the commands to install it in the right places." This led to **v12.2**:
+- `install.sh` puts the program in `/usr/local/bin/smartcopy` and the manual where `man` looks.
+- Installing an update while an old copy is still running is safe, because a running script keeps its own copy open. The old copy's log folder must stay until it finishes, and a second copy to the same destination must wait.
+
 ## Lessons
 - **Test stand-ins must behave like the real thing.** A `caffeinate` stand-in that exited at once, and a `df` stand-in that printed single spaces, each hid a bug that broke the first real run.
 - **Measure before optimising.** The 26 MB/s speed came from the destination's format and the source drive, not from the script.

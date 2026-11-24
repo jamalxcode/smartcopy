@@ -1,24 +1,28 @@
-.TH SMARTCOPY 1 "2026-11-24" "smartcopy v12.1" "User Commands"
+.TH SMARTCOPY 1 "2026-11-24" "smartcopy v12.2" "User Commands"
 .SH NAME
 smartcopy \- resumable, self-checking copy of a drive or folder on macOS, with a plain-English report
 .SH SYNOPSIS
-.B sudo ./smartcopy.sh
+.B sudo smartcopy
 .RI [ options ]
 .I SOURCE DESTINATION
 .br
-.B sudo ./smartcopy.sh \-\-verify\-only
+.B sudo smartcopy \-\-verify\-only
 .I SOURCE DESTINATION
 .br
-.B sudo ./smartcopy.sh \-\-dry\-run
+.B sudo smartcopy \-\-dry\-run
 .I SOURCE DESTINATION
 .br
-.B sudo ./smartcopy.sh \-\-speed\-test
+.B sudo smartcopy \-\-speed\-test
 .I SOURCE DESTINATION
 .br
-.B sudo ./smartcopy.sh \-\-stop
+.B sudo smartcopy \-\-stop
 .I DESTINATION
 .br
-.B sudo ./smartcopy.sh \-\-help
+.B sudo smartcopy \-\-help
+.PP
+If smartcopy isn't installed, run it from its folder as
+.B sudo ./smartcopy.sh
+with the same options.
 .SH DESCRIPTION
 .B smartcopy
 copies everything inside
@@ -126,7 +130,7 @@ Copy a whole drive into a folder on another drive:
 .PP
 .RS
 .nf
-sudo ./smartcopy.sh /Volumes/Archive "/Volumes/Backup/Archive"
+sudo smartcopy /Volumes/Archive "/Volumes/Backup/Archive"
 .fi
 .RE
 .PP
@@ -134,8 +138,8 @@ Copy just one folder:
 .PP
 .RS
 .nf
-sudo ./smartcopy.sh "/Volumes/Photos SSD/2024" "/Volumes/Backup/Photos/2024"
-sudo ./smartcopy.sh ~/Projects "/Volumes/Backup/Projects"
+sudo smartcopy "/Volumes/Photos SSD/2024" "/Volumes/Backup/Photos/2024"
+sudo smartcopy ~/Projects "/Volumes/Backup/Projects"
 .fi
 .RE
 .PP
@@ -143,7 +147,7 @@ Resume after any interruption: run the same command again.
 .PP
 .RS
 .nf
-sudo ./smartcopy.sh /Volumes/Archive "/Volumes/Backup/Archive"
+sudo smartcopy /Volumes/Archive "/Volumes/Backup/Archive"
 .fi
 .RE
 .PP
@@ -152,7 +156,7 @@ its exact path. Paths with spaces need quotes (or a backslash before each space)
 .SS Previewing
 .RS
 .nf
-sudo ./smartcopy.sh \-\-dry\-run "/Volumes/Media Drive" "/Volumes/Backup/Media"
+sudo smartcopy \-\-dry\-run "/Volumes/Media Drive" "/Volumes/Backup/Media"
 .fi
 .RE
 .SS Long copies
@@ -160,25 +164,25 @@ Start in the background, close Terminal, check progress, stop, resume:
 .PP
 .RS
 .nf
-sudo ./smartcopy.sh \-\-background /Volumes/Archive "/Volumes/Backup/Archive"
+sudo smartcopy \-\-background /Volumes/Archive "/Volumes/Backup/Archive"
 tail \-f "/Volumes/Backup/rsync\-logs/console\-20261124\-094854.log"
-sudo ./smartcopy.sh \-\-stop "/Volumes/Backup/Archive"
-sudo ./smartcopy.sh /Volumes/Archive "/Volumes/Backup/Archive"
+sudo smartcopy \-\-stop "/Volumes/Backup/Archive"
+sudo smartcopy /Volumes/Archive "/Volumes/Backup/Archive"
 .fi
 .RE
 .SS Copy now, check later
 .RS
 .nf
-sudo ./smartcopy.sh \-\-no\-verify /Volumes/Archive "/Volumes/Backup/Archive"
-sudo ./smartcopy.sh \-\-verify\-only /Volumes/Archive "/Volumes/Backup/Archive"
+sudo smartcopy \-\-no\-verify /Volumes/Archive "/Volumes/Backup/Archive"
+sudo smartcopy \-\-verify\-only /Volumes/Archive "/Volumes/Backup/Archive"
 .fi
 .RE
 .SS Speed
 .RS
 .nf
-sudo ./smartcopy.sh \-\-speed\-test /Volumes/Archive "/Volumes/Backup/Archive"
-sudo ./smartcopy.sh \-\-jobs 4 /Volumes/Archive "/Volumes/Backup/Archive"
-sudo ./smartcopy.sh \-\-jobs 1 /Volumes/Archive "/Volumes/Backup/Archive"
+sudo smartcopy \-\-speed\-test /Volumes/Archive "/Volumes/Backup/Archive"
+sudo smartcopy \-\-jobs 4 /Volumes/Archive "/Volumes/Backup/Archive"
+sudo smartcopy \-\-jobs 1 /Volumes/Archive "/Volumes/Backup/Archive"
 .fi
 .RE
 .SS Unattended
@@ -186,7 +190,7 @@ No question on the first run, and a longer patience for a flaky connection:
 .PP
 .RS
 .nf
-sudo MAX_STUCK=12 ./smartcopy.sh \-\-yes \-\-background /Volumes/Archive "/Volumes/Backup/Archive"
+sudo MAX_STUCK=12 smartcopy \-\-yes \-\-background /Volumes/Archive "/Volumes/Backup/Archive"
 .fi
 .RE
 .SS Reading the private file list
@@ -195,7 +199,7 @@ sudo MAX_STUCK=12 ./smartcopy.sh \-\-yes \-\-background /Volumes/Archive "/Volum
 open \-e "/Volumes/Backup/rsync\-logs/affected\-files\-20261124\-094854.txt"
 .fi
 .RE
-.SS Removing old logs from the Mac (left by versions before v12)
+.SS Removing old logs from the Mac (left by versions before v12; wait until any old copy finishes)
 .RS
 .nf
 sudo rm \-rf ~/rsync\-logs
@@ -306,6 +310,24 @@ Hard upper limit on passes (default 500).
 .B JOBS
 Same as
 .BR \-\-jobs .
+.SH INSTALLATION
+From the smartcopy folder:
+.PP
+.RS
+.nf
+brew install rsync
+sudo ./install.sh                 # install or update
+sudo ./install.sh \-\-uninstall     # remove
+.fi
+.RE
+.PP
+This installs
+.I /usr/local/bin/smartcopy
+and
+.IR /usr/local/share/man/man1/smartcopy.1 .
+Updating while a copy is running is safe; don't start a second copy to the same destination until it
+finishes. Copies made by older versions, including the old name safe\-copy, are picked up
+automatically.
 .SH REQUIREMENTS
 .IP \(bu 3
 macOS, run with

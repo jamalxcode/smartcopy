@@ -19,17 +19,13 @@ smartcopy looks for rsync at `/opt/homebrew/bin/rsync` (Apple silicon Macs) or `
    brew install rsync
    ```
 2. **Give Terminal Full Disk Access:** System Settings → Privacy & Security → Full Disk Access → turn on Terminal (or iTerm, if you use that), then quit and reopen it. Without this, macOS blocks protected files and they fail to copy.
-3. **Get smartcopy:**
+3. **Get and install smartcopy:**
    ```bash
    git clone https://github.com/jamalxcode/smartcopy.git
    cd smartcopy
-   chmod +x smartcopy.sh
+   sudo ./install.sh
    ```
-4. **Optional, the man page:**
-   ```bash
-   sudo mkdir -p /usr/local/share/man/man1
-   sudo cp man/smartcopy.1 /usr/local/share/man/man1/
-   ```
+   This puts the program at `/usr/local/bin/smartcopy` and the manual at `/usr/local/share/man/man1/smartcopy.1`, and checks that rsync is installed. Remove them with `sudo ./install.sh --uninstall`.
 
 ## Check everything is ready
 
@@ -61,6 +57,7 @@ smartcopy also uses standard macOS tools that are always present:
 | `awk`, `sed`, `grep`, `sort`, `find`, `du`, `xargs`, `tr`, `cut`, `wc`, `head`, `tail`, `date`, `mktemp`, `tput` | Planning, reports, the progress line |
 | `dd`, `split`, `/usr/bin/time` | `--speed-test` only |
 | `man` (mandoc) | Reading the man page |
+| `install`, `xattr` | `install.sh` only: copying files into place, removing the download flag |
 
 ## Supported setups
 

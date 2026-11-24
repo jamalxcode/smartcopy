@@ -45,13 +45,13 @@ Two system things are outside the tool's control: `sudo` records that the comman
 
 The logs reveal file names, but those names are already visible as the copied files on the same drive. For real confidentiality, encrypt the destination (Disk Utility → Erase → APFS (Encrypted)). Erasing deletes everything on the drive.
 
-## The man page
+## Installing
 
-Installing the man page (`/usr/local/share/man/man1/smartcopy.1`) is the one optional step that writes to the Mac. It contains only instructions and generic examples.
+`sudo ./install.sh` puts two program files on the Mac: `/usr/local/bin/smartcopy` and `/usr/local/share/man/man1/smartcopy.1`. They contain only the program and its instructions, with generic examples. Nothing about your files or copies is ever stored there. Uninstall with `sudo ./install.sh --uninstall`.
 
 ## Older versions
 
-Versions before v12 wrote logs to `~/rsync-logs` on the Mac, and those logs include file names. Remove them with:
+Versions before v12 wrote logs to `~/rsync-logs` on the Mac, and those logs include file names. Once any copy started with the old version has finished (it writes there while running), remove them with:
 
 ```bash
 sudo rm -rf ~/rsync-logs

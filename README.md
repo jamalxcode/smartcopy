@@ -5,7 +5,7 @@ A resumable, self-checking copy tool for macOS, built on `rsync`. It copies a wh
 Privacy comes first: **file names never appear on screen or in the report**, and **everything the tool writes stays on the destination drive**. Nothing is written to the Mac's own drive or to the source drive.
 
 ```bash
-sudo ./smartcopy.sh "/Volumes/Archive" "/Volumes/Backup/Archive"
+sudo smartcopy "/Volumes/Archive" "/Volumes/Backup/Archive"
 ```
 
 ## What it does
@@ -52,43 +52,80 @@ The rsync that comes with macOS is too old. Everything else smartcopy uses is bu
 ## Install
 
 ```bash
-brew install rsync            # or: brew bundle
+brew install rsync                                   # the one dependency (or: brew bundle)
 git clone https://github.com/jamalxcode/smartcopy.git
 cd smartcopy
-chmod +x smartcopy.sh
+sudo ./install.sh
 ```
 
-Optional: install the man page so `man smartcopy` works.
+That installs two files:
+
+| File | Where |
+|---|---|
+| the program | `/usr/local/bin/smartcopy`, so you run it from anywhere as `sudo smartcopy …` |
+| the manual | `/usr/local/share/man/man1/smartcopy.1`, read with `man smartcopy` |
+
+The installer also checks for rsync, removes the "downloaded from the internet" flag, and removes the man page of the old `safe-copy` version if it's there. Then give Terminal **Full Disk Access** (System Settings → Privacy & Security → Full Disk Access).
+
+**Downloaded the files instead of cloning?** Put `smartcopy.sh`, `smartcopy.1` and `install.sh` in one folder and run `sudo ./install.sh` from there. Or install by hand:
 
 ```bash
-sudo mkdir -p /usr/local/share/man/man1
-sudo cp man/smartcopy.1 /usr/local/share/man/man1/
-man smartcopy
+sudo mkdir -p /usr/local/bin /usr/local/share/man/man1
+sudo install -m 755 ~/Downloads/smartcopy.sh /usr/local/bin/smartcopy
+sudo install -m 644 ~/Downloads/smartcopy.1  /usr/local/share/man/man1/smartcopy.1
 ```
 
-Without installing it, you can read it with `man ./man/smartcopy.1`.
+**Check it:** `which smartcopy` should print `/usr/local/bin/smartcopy`; then run `sudo smartcopy --help`.
+
+**Without installing:** run it from the folder as `sudo ./smartcopy.sh …` and read the manual with `man ./man/smartcopy.1`.
+
+### Update
+
+Get the new files (`git pull`, or download them again), then run `sudo ./install.sh` again.
+
+- If a copy is running, it's safe to install the update, because the running copy keeps using the version it started with. Don't start a second copy to the **same** destination until the first one finishes.
+- Existing copies carry on with the new version: their markers and hash lists are picked up automatically, including copies made under the old name `safe-copy`.
+
+### Uninstall
+
+```bash
+sudo ./install.sh --uninstall
+```
+
+This removes the program and its manual. Your copies, and the `rsync-logs` folders on your drives, are left alone.
+
+### Moving from `safe-copy` (versions before v12.1)
+
+1. Install smartcopy as above.
+2. **Wait for any copy started with `safe-copy.sh` to finish.** It keeps its logs and resume progress in `~/rsync-logs` while it runs.
+3. Then remove the old files:
+   ```bash
+   rm -f ~/path/to/safe-copy.sh
+   sudo rm -rf ~/rsync-logs          # old logs on the Mac; they contain file names
+   ```
+4. To resume or check an old copy, run `sudo smartcopy` with the same source and destination.
 
 ## Usage
 
 ```bash
 # Copy a whole drive, or one folder
-sudo ./smartcopy.sh /Volumes/Archive "/Volumes/Backup/Archive"
-sudo ./smartcopy.sh ~/Projects "/Volumes/Backup/Projects"
+sudo smartcopy /Volumes/Archive "/Volumes/Backup/Archive"
+sudo smartcopy ~/Projects "/Volumes/Backup/Projects"
 
 # Preview: counts and sizes only
-sudo ./smartcopy.sh --dry-run /Volumes/Archive "/Volumes/Backup/Archive"
+sudo smartcopy --dry-run /Volumes/Archive "/Volumes/Backup/Archive"
 
 # Long copies: keep running after Terminal closes, then stop cleanly
-sudo ./smartcopy.sh --background /Volumes/Archive "/Volumes/Backup/Archive"
-sudo ./smartcopy.sh --stop "/Volumes/Backup/Archive"
+sudo smartcopy --background /Volumes/Archive "/Volumes/Backup/Archive"
+sudo smartcopy --stop "/Volumes/Backup/Archive"
 
 # Copy now, check later
-sudo ./smartcopy.sh --no-verify   /Volumes/Archive "/Volumes/Backup/Archive"
-sudo ./smartcopy.sh --verify-only /Volumes/Archive "/Volumes/Backup/Archive"
+sudo smartcopy --no-verify   /Volumes/Archive "/Volumes/Backup/Archive"
+sudo smartcopy --verify-only /Volumes/Archive "/Volumes/Backup/Archive"
 
 # Speed
-sudo ./smartcopy.sh --speed-test /Volumes/Archive "/Volumes/Backup/Archive"
-sudo ./smartcopy.sh --jobs 4     /Volumes/Archive "/Volumes/Backup/Archive"
+sudo smartcopy --speed-test /Volumes/Archive "/Volumes/Backup/Archive"
+sudo smartcopy --jobs 4     /Volumes/Archive "/Volumes/Backup/Archive"
 ```
 
 To resume after any interruption, run the same command again.
@@ -145,7 +182,8 @@ See [PRIVACY.md](PRIVACY.md). In short:
 
 ## Documentation
 
-- [`man/smartcopy.1`](man/smartcopy.1): full manual with examples
+- [`man/smartcopy.1`](man/smartcopy.1): full manual with examples (`man smartcopy` once installed)
+- [`install.sh`](install.sh): installer and uninstaller
 - [`docs/DEPENDENCIES.md`](docs/DEPENDENCIES.md): what to install, and the macOS tools it uses
 - [`docs/DESIGN.md`](docs/DESIGN.md): how it works and why
 - [`docs/CONVERSATION.md`](docs/CONVERSATION.md): how the tool was designed, one request at a time
