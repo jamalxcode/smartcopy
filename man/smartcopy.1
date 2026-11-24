@@ -1,0 +1,334 @@
+.TH SMARTCOPY 1 "2026-11-24" "smartcopy v12.1" "User Commands"
+.SH NAME
+smartcopy \- resumable, self-checking copy of a drive or folder on macOS, with a plain-English report
+.SH SYNOPSIS
+.B sudo ./smartcopy.sh
+.RI [ options ]
+.I SOURCE DESTINATION
+.br
+.B sudo ./smartcopy.sh \-\-verify\-only
+.I SOURCE DESTINATION
+.br
+.B sudo ./smartcopy.sh \-\-dry\-run
+.I SOURCE DESTINATION
+.br
+.B sudo ./smartcopy.sh \-\-speed\-test
+.I SOURCE DESTINATION
+.br
+.B sudo ./smartcopy.sh \-\-stop
+.I DESTINATION
+.br
+.B sudo ./smartcopy.sh \-\-help
+.SH DESCRIPTION
+.B smartcopy
+copies everything inside
+.I SOURCE
+into
+.IR DESTINATION .
+Either can be a whole drive (for example
+.IR /Volumes/Archive )
+or a folder on any drive. The destination folder is created if it doesn't exist.
+.PP
+It is built to finish no matter what happens along the way:
+.IP \(bu 3
+If it is interrupted (Ctrl\-C, a closed window, a crash, a power cut, an unplugged drive), run the
+.B exact same command
+again and it continues where it stopped.
+.IP \(bu 3
+If a drive disconnects, it waits for the drive to come back and carries on.
+.IP \(bu 3
+Failed files are retried automatically. Files that keep failing the same way (for example because of
+damaged areas on a drive) are reported instead of being retried for ever.
+.IP \(bu 3
+At the end it checks every file's contents, re-copies any file that doesn't match, and checks it again.
+.IP \(bu 3
+It finishes with a report in plain English: what went wrong, on which drive, how to fix it and how to
+avoid it next time.
+.PP
+It never deletes anything. Files already in the destination that aren't in the source are left alone;
+files with the same name are replaced by the source's version.
+.SH WHAT YOU SEE WHILE IT RUNS
+The work is shown as numbered steps, each saying what it is doing and what comes next:
+.PP
+.RS
+.nf
+======== STEP 1 of 4: List the files ========
+======== STEP 2 of 4: Copy the files ========
+======== STEP 3 of 4: Final pass ========
+======== STEP 4 of 4: Check every file ========
+.fi
+.RE
+.PP
+With
+.B \-\-no\-verify
+there are 3 steps; with
+.B \-\-verify\-only
+there are 2 (list, check). During copying and checking, one status line updates every few seconds:
+.PP
+.RS
+.nf
+Copying 52% \(md 1.2 TB of 2.3 TB \(md 14574 files left \(md 84 MB/s \(md TIME LEFT: 3h 40m \(md FINISHES \(~~ 15:20
+.fi
+.RE
+.PP
+The time left takes into account both the amount of data and the number of files left, and only
+moves gradually. It appears after about a minute of progress (after about 5 minutes on big jobs,
+which first measure the best speed setting). In a narrow Terminal window, less important parts are
+dropped first; the time left and finish time are always shown.
+.SH OPTIONS
+.TP
+.BR \-y ", " \-\-yes
+Skip the confirmation question on the first run. Later runs of the same copy never ask.
+.TP
+.BR \-b ", " \-\-background
+Keep running after Terminal is closed. Progress goes to a console log in the
+.I rsync\-logs
+folder; you get a notification when it finishes and the report opens in TextEdit.
+.TP
+.BR \-n ", " \-\-dry\-run
+Show how many files and how much data would be copied, without copying anything.
+.TP
+.B \-\-no\-verify
+Copy only; skip the final check of every file's contents. Run the check later with
+.BR \-\-verify\-only .
+.TP
+.B \-\-verify\-only
+Only check an earlier copy. Nothing is copied unless a file doesn't match, in which case just that
+file is copied again. A check stopped part-way continues where it stopped on the next run.
+.TP
+.B \-\-stop
+Stop a running copy cleanly (give only the destination). Run the same copy command again to resume.
+.TP
+.BI \-\-jobs " N"
+Copy or check
+.I N
+files at the same time (1\-16). By default this is tuned automatically: big jobs try 1 and 4 at a time
+for about two minutes each and keep whichever is faster.
+.TP
+.B \-\-speed\-test
+Measure both drives for about a minute (about 600 MB of test files on the destination, deleted
+afterwards) and explain what limits the speed and whether
+.B \-\-jobs
+helps.
+.TP
+.B \-\-force
+Override the safety checks: source and destination apparently swapped, a Time Machine backup as the
+source, or the whole startup disk as the source.
+.TP
+.BR \-h ", " \-\-help
+Show a short summary.
+.TP
+.B \-\-
+End of options. Use it before paths that start with a dash.
+.SH EXAMPLES
+.SS Everyday use
+Copy a whole drive into a folder on another drive:
+.PP
+.RS
+.nf
+sudo ./smartcopy.sh /Volumes/Archive "/Volumes/Backup/Archive"
+.fi
+.RE
+.PP
+Copy just one folder:
+.PP
+.RS
+.nf
+sudo ./smartcopy.sh "/Volumes/Photos SSD/2024" "/Volumes/Backup/Photos/2024"
+sudo ./smartcopy.sh ~/Projects "/Volumes/Backup/Projects"
+.fi
+.RE
+.PP
+Resume after any interruption: run the same command again.
+.PP
+.RS
+.nf
+sudo ./smartcopy.sh /Volumes/Archive "/Volumes/Backup/Archive"
+.fi
+.RE
+.PP
+Tip: type the start of the command, then drag the drive or folder from Finder into Terminal to paste
+its exact path. Paths with spaces need quotes (or a backslash before each space).
+.SS Previewing
+.RS
+.nf
+sudo ./smartcopy.sh \-\-dry\-run "/Volumes/Media Drive" "/Volumes/Backup/Media"
+.fi
+.RE
+.SS Long copies
+Start in the background, close Terminal, check progress, stop, resume:
+.PP
+.RS
+.nf
+sudo ./smartcopy.sh \-\-background /Volumes/Archive "/Volumes/Backup/Archive"
+tail \-f "/Volumes/Backup/rsync\-logs/console\-20261124\-094854.log"
+sudo ./smartcopy.sh \-\-stop "/Volumes/Backup/Archive"
+sudo ./smartcopy.sh /Volumes/Archive "/Volumes/Backup/Archive"
+.fi
+.RE
+.SS Copy now, check later
+.RS
+.nf
+sudo ./smartcopy.sh \-\-no\-verify /Volumes/Archive "/Volumes/Backup/Archive"
+sudo ./smartcopy.sh \-\-verify\-only /Volumes/Archive "/Volumes/Backup/Archive"
+.fi
+.RE
+.SS Speed
+.RS
+.nf
+sudo ./smartcopy.sh \-\-speed\-test /Volumes/Archive "/Volumes/Backup/Archive"
+sudo ./smartcopy.sh \-\-jobs 4 /Volumes/Archive "/Volumes/Backup/Archive"
+sudo ./smartcopy.sh \-\-jobs 1 /Volumes/Archive "/Volumes/Backup/Archive"
+.fi
+.RE
+.SS Unattended
+No question on the first run, and a longer patience for a flaky connection:
+.PP
+.RS
+.nf
+sudo MAX_STUCK=12 ./smartcopy.sh \-\-yes \-\-background /Volumes/Archive "/Volumes/Backup/Archive"
+.fi
+.RE
+.SS Reading the private file list
+.RS
+.nf
+open \-e "/Volumes/Backup/rsync\-logs/affected\-files\-20261124\-094854.txt"
+.fi
+.RE
+.SS Removing old logs from the Mac (left by versions before v12)
+.RS
+.nf
+sudo rm \-rf ~/rsync\-logs
+.fi
+.RE
+.SH HOW CHECKING WORKS
+The check reads every file and compares fingerprints (xxh128 hashes) of the source and destination
+copies. Each file's fingerprint is also saved in
+.I .smartcopy\-hashes
+on the destination, while copying and while checking. After that, files with a saved fingerprint are
+checked by reading
+.B only the destination
+\(em usually much faster when the source is the slower drive \(em and a backup can be re-checked even
+without the source connected. Files that changed on the source since they were copied are always
+compared with the source instead.
+.SH PRIVACY AND WHERE FILES ARE WRITTEN
+File names are never shown on screen, in the report or in notifications. Where it matters which files
+are affected, the report gives a count and points to a private file list.
+.PP
+Everything the script writes goes on the
+.B destination
+drive. Nothing is written to the Mac's own drive or to the source drive. If the destination drive isn't
+connected, the script waits and creates nothing in its place.
+.PP
+On exFAT and FAT drives, files can't be restricted to one user: anyone with the drive can open the
+logs, just as they can open the copied files. For real confidentiality, use an encrypted APFS
+destination.
+.SH FILES
+On the destination drive, in the hidden folder
+.I rsync\-logs
+at the top of the drive (inside the destination folder if it isn't an external drive). Press
+Cmd\-Shift\-. in Finder to see hidden items.
+.TP
+.I report\-STAMP.txt
+The plain-English report for each run.
+.TP
+.I affected\-files\-STAMP.txt
+Private list of the files behind each problem.
+.TP
+.I copy\-STAMP.log
+Everything rsync did.
+.TP
+.I verify\-STAMP.txt
+Results of the check (only differences are listed).
+.TP
+.I console\-STAMP.log
+Screen output of a
+.B \-\-background
+run.
+.TP
+.I speedtest\-STAMP.txt
+Results of
+.BR \-\-speed\-test .
+.TP
+.I locks/
+Stops two copies writing to the same destination at the same time.
+.TP
+.I .verified\-*
+Which files a stopped check has already confirmed, so it can resume.
+.PP
+In the destination folder:
+.TP
+.I .smartcopy\-target
+Records what the destination is a copy of; used to resume without asking and to catch swapped
+source and destination.
+.TP
+.I .smartcopy\-hashes
+Saved fingerprints of every file.
+.TP
+.I .rsync\-partial/
+Half-copied files, kept aside until finished (APFS and Mac OS Extended destinations only; on exFAT,
+files are written in place and an unfinished one is simply copied again).
+.SH EXIT STATUS
+.TP
+.B 0
+Finished: copied and verified, checked, copied with
+.BR \-\-no\-verify ,
+dry run, or cancelled before starting.
+.TP
+.B 1
+Stopped because of a problem the report explains (for example a full or read-only destination,
+a missing source folder, or a setup error).
+.TP
+.B 2
+Some files still differ from the source after repair.
+.TP
+.B 3
+Copied, except files that couldn't be read or written; they are counted in the report and listed
+privately.
+.TP
+.B 20
+Stopped by you (Ctrl\-C or
+.BR \-\-stop ).
+Run the same command again to resume.
+.PP
+If it gives up after repeated passes with no progress, it exits with rsync's own error code.
+.SH ENVIRONMENT
+Put these after
+.B sudo
+and before the script name.
+.TP
+.B MAX_STUCK
+Give up after this many passes in a row that copy nothing new (default 6).
+.TP
+.B MAX_PASSES
+Hard upper limit on passes (default 500).
+.TP
+.B JOBS
+Same as
+.BR \-\-jobs .
+.SH REQUIREMENTS
+.IP \(bu 3
+macOS, run with
+.BR sudo .
+.IP \(bu 3
+rsync 3.2 or newer from Homebrew:
+.BR "brew install rsync" .
+The rsync that comes with macOS is too old.
+.IP \(bu 3
+Terminal with Full Disk Access (System Settings > Privacy & Security > Full Disk Access), or
+protected files can't be read.
+.SH NOTES
+.IP \(bu 3
+Keep a MacBook plugged in with the lid open; the script stops the Mac sleeping, but closing the lid
+still sleeps it. If it does sleep, run the same command again.
+.IP \(bu 3
+exFAT destinations work but are slower on a Mac and don't keep owners, permissions, Finder tags or
+symbolic links. For Mac-only drives, APFS is faster and keeps everything.
+.IP \(bu 3
+This makes a data copy, not a bootable clone of a macOS system.
+.IP \(bu 3
+File names containing a tab or a line break aren't supported.
+.SH SEE ALSO
+.BR rsync (1),
+.BR diskutil (8),
+.BR caffeinate (8)
