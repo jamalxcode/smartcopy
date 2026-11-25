@@ -38,6 +38,15 @@ Ways to make it fit your day:
 - `--no-verify` now, `--verify-only` later (overnight, for example). Both can be stopped and resumed.
 - After the first full check, re-checks read only the destination, which is usually much faster.
 - Biggest speed-up: if the destination is only used with Macs, format it as **APFS** instead of exFAT. Erasing deletes everything on it.
+- Copying from a **spinning hard drive** and only the total time matters? Try `--engine batch`. The default engine lists and copies at the same time, which starts copying sooner but makes a hard drive's head jump between the two.
+
+**How much faster is v13?** It depends on what limits the copy.
+- Big files on slow drives, like the 1 TB runs above: the drives set the pace, so expect only about 3–10% less time.
+- A copy that was stopped and resumed: about 20–40% less time, because files copied before the stop are no longer re-read from the source during the check.
+- Hundreds of thousands to millions of small files: about 30–60% less time.
+- Copying starts within seconds instead of after a few minutes of listing.
+
+These are estimates from measurements on a test bed, where jobs finished 48–59% sooner than with v12.2. Details are in [docs/PERFORMANCE.md](docs/PERFORMANCE.md).
 
 ## Requirements
 

@@ -104,6 +104,12 @@ Any hash has to read every byte, so hashing alone doesn't skip reading. Saving t
 - Measuring exposed real bugs: a finished check made the next `--verify-only` skip everything; a stopped copy lost its fingerprints; names with tabs or line breaks failed; and incremental listing with hard links could hang.
 - Automated tests (`tests/run.sh`) check the privacy rules: nothing written outside the destination, no names on screen or in reports, no network, a safe pause when the destination is unplugged.
 
+## 18. A streaming engine
+"Redesign SmartCopy's internal execution architecture around a continuous streaming pipeline… begin transferring files immediately… bounded producer-consumer… retaining the existing engine as a fallback." This led to **v13.0**:
+- Listing, copying and checking now run as one pipeline: the source is listed once, batches are cut and copied as files are found, and copied files are checked while later ones copy. Queues are bounded, with backpressure.
+- The v12.3 engine stays as `--engine batch` and as an automatic fallback if the listing is cut off.
+- On the test bed the first file was copied at 0.8 s instead of 5.8 s (250,000 files), and jobs finished 19–22% sooner than with the batch engine. On real Macs limited by slow drives, an uninterrupted big copy is expected to gain only a few percent; resumed copies and many small files gain much more (see PERFORMANCE.md).
+
 ## Lessons
 - **Test stand-ins must behave like the real thing.** A `caffeinate` stand-in that exited at once, and a `df` stand-in that printed single spaces, each hid a bug that broke the first real run.
 - **Measure before optimising.** The 26 MB/s speed came from the destination's format and the source drive, not from the script.

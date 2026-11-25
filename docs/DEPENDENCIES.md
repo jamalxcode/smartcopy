@@ -43,7 +43,7 @@ smartcopy also uses standard macOS tools that are always present:
 
 | Tool | Used for |
 |---|---|
-| `/bin/bash` | Runs the script (works with macOS's bash 3.2) |
+| `/bin/bash` | Runs the script. Written for macOS's bash 3.2 (no bash 4 features or here-documents). The streaming engine also uses process substitution and `read -t`/`-u`, which bash 3.2 has. It was tested with bash 5 on Linux; `--engine batch` avoids both. |
 | `sudo` | Preserves owners and permissions, and reads protected files |
 | `diskutil` | Drive format, volume ID, SSD or hard drive, turning ownership on |
 | `df`, `stat` | Checking drives are mounted, free space |

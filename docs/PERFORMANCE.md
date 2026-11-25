@@ -261,6 +261,19 @@ The full test suite passes on both engines: 62 of 62 checks with the stream engi
 - **`--verify-only`** uses the batch engine's listing in both cases (25.4 s against 26.6 s for 250,000 files: the same code).
 - One single run of the batch engine on the mixed dataset took 100 s, because the test disk stalled during copying. The interleaved repeats above (16.6–17.0 s) are the representative figures.
 
+## What to expect on a Mac (estimate)
+
+The test bed's disks are fast, so per-file work dominates there and the gains look large: from v12.2 to v13, 48% less time for 50,000 mixed files and 59% less for 250,000 small files. On a Mac, how much of this shows depends on what limits the copy. These figures are estimates, not measurements on a Mac:
+
+| Situation | Expected gain over v12.2 | Why |
+|---|---|---|
+| One uninterrupted big copy limited by the drives (e.g. 1 TB, ~10 MB average file, spinning source → exFAT SSD at 25–30 MB/s, ~10 h) | **about 3–10% less time** (20–60 min) | The drives set the pace. The savings are the passes over the drives that are no longer made: the folder-size scan, a full final pass, and the source and destination listed together. |
+| A copy that was stopped and resumed | **about 20–40% less time** | v12.2 lost the fingerprints of files copied before the stop, so the check re-read them from the (slow) source. v13 keeps them and reads only the destination. |
+| Hundreds of thousands to millions of small files | **about 30–60% less time** | Per-file work dominates, which is what was optimised (close to the test bed's results). |
+| Time until the first file is copied | **seconds instead of minutes** | The streaming engine starts after finding the first 100 files instead of listing both drives completely. |
+
+With a spinning hard drive as the source, the streaming engine's overlap of listing and copying makes the drive's head move between the two. Copying still starts sooner, but the total can be a little longer than with `--engine batch`. A run of each engine on the actual drives settles it.
+
 ## Reproducing
 
 ```bash
