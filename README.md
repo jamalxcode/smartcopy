@@ -62,6 +62,23 @@ The rsync that comes with macOS is too old. Everything else smartcopy uses is bu
 
 ## Install
 
+**Download:** [smartcopy (latest, zip)](https://github.com/jamalxcode/smartcopy/archive/refs/heads/main.zip)
+
+**Quickest: install or update with curl** (no git needed). Paste this into Terminal:
+
+```bash
+brew install rsync                                   # the one dependency (skip if already installed)
+cd ~/Downloads
+curl -fL -o smartcopy.zip https://github.com/jamalxcode/smartcopy/archive/refs/heads/main.zip
+unzip -oq smartcopy.zip
+cd smartcopy-main
+sudo ./install.sh
+```
+
+Then check the version: `sudo smartcopy --help | head -1` should show `smartcopy v13.0` or newer. You can then delete `~/Downloads/smartcopy.zip` and `~/Downloads/smartcopy-main`.
+
+**Or with git:**
+
 ```bash
 brew install rsync                                   # the one dependency (or: brew bundle)
 git clone https://github.com/jamalxcode/smartcopy.git
@@ -92,7 +109,7 @@ sudo install -m 644 ~/Downloads/smartcopy.1  /usr/local/share/man/man1/smartcopy
 
 ### Update
 
-Get the new files (`git pull`, or download them again), then run `sudo ./install.sh` again.
+Run the same curl commands as above. They download the latest version over the old one and install it. With a git clone, run `git pull` in the folder, then `sudo ./install.sh` again.
 
 - If a copy is running, it's safe to install the update, because the running copy keeps using the version it started with. Don't start a second copy to the **same** destination until the first one finishes.
 - Existing copies carry on with the new version: their markers and hash lists are picked up automatically, including copies made under the old name `safe-copy`.
