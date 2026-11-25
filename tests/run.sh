@@ -27,13 +27,16 @@
 #   stream      streaming engine: copies while listing, checks copied files as it goes, totals marked
 #               as "found so far" until the listing ends
 #   streamfail  the listing is killed mid-way: the run carries on with a full listing and finishes verified
+#   nospin      mid-copy, the destination's place is taken by a folder on the system disk (it looks
+#               mounted but isn't the drive): smartcopy must wait with paced retries — not spin and
+#               flood the screen (a beachball) — and write nothing into that folder
 #   lib         unit tests of the file-list library (record format, merges, batches)
 # Env: SMARTCOPY_ENGINE=batch runs the tests on the earlier engine (the fallback).
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$(cd "$here/.." && pwd)/smartcopy.sh"
 if [ $# -gt 0 ] && [ -f "$1" ]; then SCRIPT="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"; shift; fi
-TESTS="${*:-lib copy stream streamfail privacy nowrites nonet corrupt recheck checkpoint resume disconnect dryrun errors exfat stop}"
+TESTS="${*:-lib copy stream streamfail nospin privacy nowrites nonet corrupt recheck checkpoint resume disconnect dryrun errors exfat stop}"
 IMG="${IMG:-/tmp/sc-test-img}"; W="${W:-/tmp/sc-test-work}"
 SRCV=/Volumes/SCTSRC; DSTV=/Volumes/SCTDST
 PASS=0; FAIL=0; FAILED=""
@@ -258,6 +261,24 @@ t_streamfail() {
   check "run carries on with a full listing" grep -q "The listing was cut off" "$W/sf.out"
   check "and finishes verified (exit $rc)" bash -c "[ $rc -eq 0 ] && grep -q 'Copied and verified' $W/sf.out"
   check "copy identical" same_trees
+}
+
+t_nospin() {
+  NFILES=12000 fresh --big 2 --big-mb 64
+  local fake="$W/fakevol" p i=0 cpu lines
+  rm -rf "$fake"; mkdir -p "$fake"
+  setsid bash "$SCRIPT" --yes --jobs 1 "$SRCV/data" "$DSTV/copy" > "$W/ns.out" 2>&1 < /dev/null &
+  p=$!
+  # at the final pass, where a refused destination used to be retried with no pause at all
+  while [ $i -lt 1200 ] && ! grep -q "Final pass ━" "$W/ns.out"; do sleep 0.05; i=$(( i + 1 )); done
+  umount -l "$DSTV"; mount --bind "$fake" "$DSTV"      # looks mounted, but it's a folder on the system disk
+  sleep 25
+  cpu=$(ps -o times= -p "$p" 2>/dev/null | tr -d ' '); lines=$(wc -l < "$W/ns.out")
+  pkill -TERM -s "$p" 2>/dev/null; sleep 2; pkill -KILL -s "$p" 2>/dev/null
+  umount "$DSTV" 2>/dev/null
+  check "no busy loop: main process used ${cpu:-?} s of CPU in 25 s" [ "${cpu:-99}" -le 3 ]
+  check "no flood of messages ($lines lines of output)" [ "$lines" -le 80 ]
+  check "nothing written into the folder in the drive's place" bash -c "[ -z \"\$(ls -A $fake)\" ]"
 }
 
 t_dryrun() {

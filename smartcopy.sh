@@ -1,5 +1,5 @@
 #!/bin/bash
-# smartcopy v13.0 — resumable, self-healing copy of a drive OR a folder on macOS, with checksum
+# smartcopy v13.1 — resumable, self-healing copy of a drive OR a folder on macOS, with checksum
 # verification and a plain-English report of every problem, with steps to fix and avoid it.
 #
 #   sudo smartcopy SOURCE DESTINATION                copy (asks to confirm the first time)
@@ -18,7 +18,7 @@
 #           --verify-only only run the checksum check on a finished copy (e.g. later, overnight)
 #           --jobs N      copy N files side by side (default: tuned automatically while copying)
 #           --force       override safety checks (swapped drives, Time Machine, whole boot disk)
-#           --engine batch  list everything first, then copy (default: stream — list and copy at once)
+#           --engine X    stream (list and copy at once) or batch (list, then copy); default: auto
 # Resume:   run the exact same command again after any interruption, crash or reboot.
 # Privacy:  file names are never shown on screen or in the report. Where it matters which files
 #           are affected, the report gives a count and points to a private list in the log folder
@@ -30,6 +30,9 @@
 #           and checking, so later checks only need to read the destination drive.
 
 set -u
+# macOS's own tools first: the script relies on their options (stat -f, date -r, ...), and GNU versions
+# from Homebrew earlier in the PATH would behave differently. (rsync is always called by full path.)
+[ "$(uname)" = Darwin ] && PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH"
 
 TAB="$(printf '\t')"
 ts()   { date '+%F %T'; }
@@ -349,7 +352,7 @@ MAX_STUCK="${MAX_STUCK:-6}"
 MAX_PASSES="${MAX_PASSES:-500}"
 VERIFY="${VERIFY:-1}"
 YES=0; DETACH=0; FORCE=0; DRYRUN=0; STOP=0; VERIFY_ONLY=0; SPEEDTEST=0; JOBS="${JOBS:-auto}"
-ENGINE="${SMARTCOPY_ENGINE:-stream}"   # stream (lists and copies at the same time) or batch (v12.3: list, then copy)
+ENGINE="${SMARTCOPY_ENGINE:-auto}"     # stream (list and copy at once), batch (v12.3: list, then copy) or auto
 POS=()
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -389,7 +392,7 @@ fatal() {
   exit 1
 }
 
-case "$ENGINE" in stream|batch) ;; *) fatal "--engine must be stream or batch" ;; esac
+case "$ENGINE" in stream|batch|auto) ;; *) fatal "--engine must be stream, batch or auto" ;; esac
 [ "$(id -u)" -eq 0 ] || fatal "Please run this with sudo." "" "Put sudo in front of the command, e.g.: sudo $0 SOURCE DESTINATION"
 
 # ---------------- Path helpers ----------------
@@ -511,7 +514,10 @@ VOLUMES_DEV="$(dev_of /Volumes)"
 
 # Is the current directory really on the destination drive (not a leftover folder on the Mac's drive)?
 on_dst_volume() {
-  case "$DST_VOL" in /Volumes/?*) [ -n "$VOLUMES_DEV" ] && [ "$(dev_of .)" != "$VOLUMES_DEV" ] ;; *) return 0 ;; esac
+  case "$DST_VOL" in
+    /Volumes/?*) if [ -n "$VOLUMES_DEV" ]; then [ "$(dev_of .)" != "$VOLUMES_DEV" ]; else is_mounted "$DST_VOL"; fi ;;
+    *) return 0 ;;
+  esac
 }
 # in_dst CMD...: run CMD with the destination folder as its working directory, or exit 98 if the
 # destination drive isn't really there. Writing through the working directory means that if the
@@ -542,6 +548,30 @@ init_logs() {
   LOGS_READY=1; REPORT_ON=1
 }
 drives_here() { is_mounted "$SRC_VOL" && is_mounted "$DST_VOL" && [ -d "$RUNDIR" ]; }
+# await_drives: call before retrying something that failed because a drive or the run folder was
+# missing. Waits for both drives, puts the run folder back if it's gone, and paces the retries
+# (5 s, 10 s, … up to 30 s) — never a busy loop. Gives up after 20 retries in a row.
+AWAIT_N=0
+await_drives() {
+  wait_for_mounts
+  [ -d "$RUNDIR/tmp" ] || { [ -d "$LOGDIR" ] && mkdir -p "$RUNDIR/tmp" 2>/dev/null; }
+  AWAIT_N=$(( AWAIT_N + 1 ))
+  if [ "$AWAIT_N" -ge 20 ]; then
+    fatal "The destination folder can't be reached, although its drive seems connected." \
+      "smartcopy tried 20 times in a row to start copying into $DST and couldn't." \
+      "Eject the destination drive, plug it in again and run Disk Utility > First Aid on it.
+Then run the same command again — it carries on from where it stopped." "" DESTINATION
+  fi
+  sleep $(( AWAIT_N < 6 ? AWAIT_N * 5 : 30 ))
+}
+# launch_dst OUT ERR|- CMD...: in_dst CMD in the background, output to OUT and errors to ERR (- = OUT,
+# appended). If those files can't be opened (drive gone), the shell's error stays off the screen.
+launch_dst() {
+  local out="$1" err="$2"; shift 2
+  if [ "$err" = - ]; then { in_dst "$@" >> "$out" 2>&1 & } 2>/dev/null
+  else { in_dst "$@" > "$out" 2> "$err" & } 2>/dev/null; fi
+  LAUNCHED=$!
+}
 logs_here() {   # the log folder can be written: logs set up, and the destination drive is connected
   [ "$LOGS_READY" -eq 1 ] && is_mounted "$DST_VOL" && [ -d "$LOGDIR" ]
 }
@@ -1170,6 +1200,13 @@ else
   [ "$JOBS" -ge 1 ] && [ "$JOBS" -le 16 ] || fatal "--jobs must be between 1 and 16"
   JOBS_WHY="you chose --jobs $JOBS"
 fi
+# Engine: streaming for SSD sources; a hard drive's head would jump between listing and copying, so
+# hard-drive (or unknown) sources list first, then copy.
+ENGINE_WHY="you chose --engine $ENGINE"
+if [ "$ENGINE" = auto ]; then
+  if [ "$SRC_SSD" = "Yes" ]; then ENGINE=stream; ENGINE_WHY="the source is an SSD"
+  else ENGINE=batch; ENGINE_WHY="the source is $([ "$SRC_SSD" = No ] && echo "a hard drive" || echo "not known to be an SSD")"; fi
+fi
 TM_RUNNING=0
 tmutil status 2>/dev/null | grep -q 'Running = 1' && TM_RUNNING=1
 
@@ -1427,6 +1464,7 @@ echo "From:   $SRC_DESC"
 [ "$VERIFY_ONLY" -eq 1 ] && echo "Task:   check an existing copy (nothing will be copied unless a file doesn't match)"
 echo "Into:   $DST   (drive: $DST_VOL, $FS_LABEL)"
 echo "Copies at a time: $([ "$AUTO_TUNE" -eq 1 ] && echo "automatic" || echo "$JOBS") ($JOBS_WHY)"
+[ "$VERIFY_ONLY" -eq 0 ] && echo "Engine: $([ "$ENGINE" = stream ] && echo "streaming — lists and copies at the same time" || echo "batch — lists everything, then copies") ($ENGINE_WHY)"
 echo "Log:    $LOG"
 echo
 
@@ -1458,15 +1496,16 @@ copy_loop() {
       delta=--no-whole-file
     fi
     t0=$SECONDS
-    in_dst "$RSYNC" "${META[@]}" "${COMMON[@]}" "${CSUM[@]}" "${WRITE_MODE[@]}" "$delta" ${extra[@]+"${extra[@]}"} "${EXCLUDES[@]}" \
-      "$SRC/" ./ > "$PASSLOG" 2> "$PASSERR" &
-    local rpid=$!
+    launch_dst "$PASSLOG" "$PASSERR" "$RSYNC" "${META[@]}" "${COMMON[@]}" "${CSUM[@]}" "${WRITE_MODE[@]}" "$delta" \
+      ${extra[@]+"${extra[@]}"} "${EXCLUDES[@]}" "$SRC/" ./
+    local rpid=$LAUNCHED
     heartbeat "$rpid" "$label: going through all files on both drives"
     wait "$rpid"; rc=$?
     COPY_SECS=$(( COPY_SECS + SECONDS - t0 ))
     if [ "$rc" -eq 98 ] || ! drives_here; then  # a drive went away (even before rsync could start): wait, try again
-      TOTAL_PASSES=$(( TOTAL_PASSES - 1 )); pass=$(( pass - 1 )); continue
+      TOTAL_PASSES=$(( TOTAL_PASSES - 1 )); pass=$(( pass - 1 )); await_drives; continue
     fi
+    AWAIT_N=0
     r=$(harvest_copy "$PASSLOG" "$JOURNAL"); [ -n "$r" ] || r="0 0"   # fingerprints of what this pass copied
     COPIED_FILES=$(( COPIED_FILES + ${r#* } )); COPIED_BYTES=$(( COPIED_BYTES + ${r% *} ))
     cat "$PASSLOG" 2>/dev/null >> "$LOG"
@@ -1651,7 +1690,7 @@ plan_scan() {
       0|24) PLAN_COMPLETE=1; break ;;
       23)   PLAN_COMPLETE=0; break ;;            # some items couldn't be read; the copy reports them
     esac
-    drives_here || { tries=$(( tries - 1 )); rc=0; }   # a drive went away: wait for it, don't count the try
+    drives_here || { await_drives; tries=$(( tries - 1 )); rc=0; }   # a drive went away: wait for it, don't count the try
     case $rc in
       20)   RESULT="⏸ Stopped before finishing — run the same command again to resume."; exit 20 ;;
       1|2|4) fatal "rsync couldn't start (error code $rc)." \
@@ -1779,17 +1818,17 @@ run_batches() {    # run_batches copy|verify|hash PREFIX TOTAL_BYTES TOTAL_FILES
       for slot in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do [ -z "${PIDS[slot]:-}" ] && break; done
       b=$next; printf -v f '%s.%04d' "$pre" "$b"
       if [ "$mode" = copy ]; then
-        in_dst "$RSYNC" "${META[@]}" -r "--out-format=$FMT" "${CSUM[@]}" "${WRITE_MODE[@]}" "$COPY_DELTA" \
-          "${EXCLUDES[@]}" --from0 --files-from="$f" "$SRC/" ./ > "$f.log" 2> "$f.err" &
+        launch_dst "$f.log" "$f.err" "$RSYNC" "${META[@]}" -r "--out-format=$FMT" "${CSUM[@]}" "${WRITE_MODE[@]}" "$COPY_DELTA" \
+          "${EXCLUDES[@]}" --from0 --files-from="$f" "$SRC/" ./
       elif [ "$mode" = verify ]; then
-        in_dst "$RSYNC" "${META[@]}" -r --checksum "${CSUM[@]}" --dry-run -ii "--out-format=$FMT" \
-          "${EXCLUDES[@]}" --from0 --files-from="$f" "$SRC/" ./ > "$f.out" 2> "$f.err" &
+        launch_dst "$f.out" "$f.err" "$RSYNC" "${META[@]}" -r --checksum "${CSUM[@]}" --dry-run -ii "--out-format=$FMT" \
+          "${EXCLUDES[@]}" --from0 --files-from="$f" "$SRC/" ./
       elif [ "$mode" = hash ]; then
         # Destination only: list its files into an empty folder; nothing is written, only hashes are read
-        in_dst "$RSYNC" -r -8 --checksum "${CSUM[@]}" --dry-run -i "--out-format=$FMT" \
-          --from0 --files-from="$f" ./ "$EMPTY_DIR/" > "$f.out" 2> "$f.err" &
+        launch_dst "$f.out" "$f.err" "$RSYNC" -r -8 --checksum "${CSUM[@]}" --dry-run -i "--out-format=$FMT" \
+          --from0 --files-from="$f" ./ "$EMPTY_DIR/"
       fi
-      PIDS[slot]=$!; BATCH[slot]=$b; next=$(( next + 1 )); running=$(( running + 1 ))
+      PIDS[slot]=$LAUNCHED; BATCH[slot]=$b; next=$(( next + 1 )); running=$(( running + 1 ))
     done
     TUNING=$cal; progress_line "$label" "$done_b" "$tb" "$done_f" "$tf"
     [ "$running" -eq 0 ] && [ "$next" -gt "$NB" ] && break
@@ -1807,8 +1846,9 @@ batch_copy() {
   until make_batches "$PLAN" "$pre" copy "$TODO_BYTES"; do
     drives_here && fatal "Couldn't write the file list on the destination drive." \
       "The drive may be full." "Free some space on the destination, then run the same command again." "" DESTINATION
-    wait_for_mounts
+    await_drives
   done
+  AWAIT_N=0
   local b0=$COPIED_BYTES
   t0=$SECONDS
   run_batches copy "$pre" "$TODO_BYTES" "$TODO_FILES"
@@ -1843,6 +1883,7 @@ batch_copy() {
 #   carries on with the batch engine: a full listing of both drives, then copying what's left.
 # All lists and batches live in the run folder on the destination; the queues themselves are in memory.
 STREAM_QMAX=4; STREAM_VQMAX=16; STREAM_CHECKERS=1
+case "$DST_FS" in exfat|msdos) STREAM_CHECKERS=0 ;; esac   # macOS's exFAT/FAT driver is slow: check at the end
 DISC_META=("${META[@]}"); DISC_META[0]="${META[0]//[AXN]/}"   # listing: no ACLs/xattrs/creation dates needed
 stream_producer() {
   "$RSYNC" "${DISC_META[@]}" --dry-run -ii --out-format='%i %l %M %n' "${EXCLUDES[@]}" "$SRC/" "$STREAM_EMPTY/" 2> "$RUNDIR/scan.err" \
@@ -1879,7 +1920,7 @@ stream_copy() {
       COPIED_BYTES=$(( COPIED_BYTES + cb )); COPIED_FILES=$(( COPIED_FILES + cf ))
       fin_b=$(( fin_b + xb )); fin_f=$(( fin_f + xf ))
       cat "$f.err" 2>/dev/null >> "$ALLERR"; rm -f "$f" "$f.log" "$f.err"
-      if [ "$VERIFY" != 0 ] && [ -s "$f.rec" ] && [ ${#VQ[@]} -lt "$STREAM_VQMAX" ] && { [ "$rc" -eq 0 ] || [ "$rc" -eq 23 ] || [ "$rc" -eq 24 ]; }; then
+      if [ "$VERIFY" != 0 ] && [ "$STREAM_CHECKERS" -gt 0 ] && [ -s "$f.rec" ] && [ ${#VQ[@]} -lt "$STREAM_VQMAX" ] && { [ "$rc" -eq 0 ] || [ "$rc" -eq 23 ] || [ "$rc" -eq 24 ]; }; then
         VQ+=("$b")
       else rm -f "$f.rec"; fi                                    # checked in the final check instead
     done
@@ -1902,9 +1943,9 @@ stream_copy() {
       b="${VQ[0]}"; VQ=(${VQ[@]+"${VQ[@]:1}"}); printf -v f '%s.%04d' "$pre" "$b"
       for slot in 1 2 3 4; do [ -z "${VPIDS[slot]:-}" ] && break; done
       nul_list < "$f.rec" > "$f.v0"
-      in_dst "$RSYNC" -r -8 --checksum "${CSUM[@]}" --dry-run -i "--out-format=$FMT" \
-        --from0 --files-from="$f.v0" ./ "$STREAM_EMPTY/" > "$f.vout" 2> "$f.verr" &
-      VPIDS[slot]=$!; VBATCH[slot]=$b; vrunning=$(( vrunning + 1 ))
+      launch_dst "$f.vout" "$f.verr" "$RSYNC" -r -8 --checksum "${CSUM[@]}" --dry-run -i "--out-format=$FMT" \
+        --from0 --files-from="$f.v0" ./ "$STREAM_EMPTY/"
+      VPIDS[slot]=$LAUNCHED; VBATCH[slot]=$b; vrunning=$(( vrunning + 1 ))
     done
     # --- speed tuning, once the job is known to be big: 1 at a time against 4 at a time
     if [ "$AUTO_TUNE" -eq 1 ] && [ "$cal" -eq 0 ] && [ "$stage" -eq 0 ] && [ -z "${TUNED_copy:-}" ] \
@@ -1931,9 +1972,9 @@ stream_copy() {
       if ! is_mounted "$SRC_VOL" || ! is_mounted "$DST_VOL"; then printf '\n'; wait_for_mounts; fi
       b="${Q[0]}"; Q=(${Q[@]+"${Q[@]:1}"}); printf -v f '%s.%04d' "$pre" "$b"
       for slot in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do [ -z "${PIDS[slot]:-}" ] && break; done
-      in_dst "$RSYNC" "${META[@]}" -r -ii "--out-format=$FMT" "${CSUM[@]}" "${WRITE_MODE[@]}" "$COPY_DELTA" \
-        "${EXCLUDES[@]}" --from0 --files-from="$f" "$SRC/" ./ > "$f.log" 2> "$f.err" &
-      PIDS[slot]=$!; BATCH[slot]=$b; running=$(( running + 1 ))
+      launch_dst "$f.log" "$f.err" "$RSYNC" "${META[@]}" -r -ii "--out-format=$FMT" "${CSUM[@]}" "${WRITE_MODE[@]}" "$COPY_DELTA" \
+        "${EXCLUDES[@]}" --from0 --files-from="$f" "$SRC/" ./
+      PIDS[slot]=$LAUNCHED; BATCH[slot]=$b; running=$(( running + 1 ))
     done
     # --- take announcements from the router while there's room in the queue (this read is also the
     #     loop's one-second tick; a full queue leaves the router waiting)
@@ -2013,8 +2054,9 @@ verify() {
     until sel=$(select_checks "$list" "$man" "$cj" "$vs" "$hc" "$full"); do   # a drive went away: wait, try again
       drives_here && fatal "Couldn't work out which files to check." "Writing the check list on the destination drive failed — it may be full." \
         "Free some space on the destination, then run the same command again." "" DESTINATION
-      printf '\n'; wait_for_mounts
+      printf '\n'; await_drives
     done
+    AWAIT_N=0
     words "$sel" skipped hn hb vf vb
     [ "$skipped" -gt 0 ] && done_msg "$skipped files were already checked (as they were copied, or by a check that was stopped) — skipping those."
   else
@@ -2028,8 +2070,9 @@ verify() {
     until make_batches "$hc" "$hpre" hash "$hb"; do
       drives_here && fatal "Couldn't write the file list on the destination drive." \
         "The drive may be full." "Free some space on the destination, then run the same command again." "" DESTINATION
-      wait_for_mounts
+      await_drives
     done
+    AWAIT_N=0
     run_batches hash "$hpre" "$hb" "$hn"
     for b in $RETRY_BATCHES; do         # batches that couldn't be read are checked the full way instead
       printf -v f '%s.%04d' "$hpre" "$b"
@@ -2044,14 +2087,15 @@ verify() {
     until make_batches "$full" "$pre" check "$vb"; do
       drives_here && fatal "Couldn't write the file list on the destination drive." \
         "The drive may be full." "Free some space on the destination, then run the same command again." "" DESTINATION
-      wait_for_mounts
+      await_drives
     done
+    AWAIT_N=0
     run_batches verify "$pre" "$vb" "$vf"
     for b in $RETRY_BATCHES; do         # batches cut off by a drive dropping out: once more
       printf -v f '%s.%04d' "$pre" "$b"; wait_for_mounts
-      ( in_dst "$RSYNC" "${META[@]}" -r --checksum "${CSUM[@]}" --dry-run -ii "--out-format=$FMT" \
-        "${EXCLUDES[@]}" --from0 --files-from="$f" "$SRC/" ./ ) > "$f.out" 2> "$f.err"
-      rc=$?
+      launch_dst "$f.out" "$f.err" "$RSYNC" "${META[@]}" -r --checksum "${CSUM[@]}" --dry-run -ii "--out-format=$FMT" \
+        "${EXCLUDES[@]}" --from0 --files-from="$f" "$SRC/" ./
+      wait "$LAUNCHED"; rc=$?
       case $rc in 0|24) ;; 23) HAD23=1 ;; 20) RESULT="⏸ Stopped during verification — run the same command again to redo it."; exit 20 ;; *) vrc=$rc ;; esac
       r=$(finish_check "$f.out" "$JOURNAL" "$VERIFYLOG"); cat "$f.err" 2>/dev/null >> "$VERIFYLOG"
     done
@@ -2060,9 +2104,9 @@ verify() {
   fi
   rm -f "$hc" "$full" "$RUNDIR/checkpoint"
   wait_for_mounts
-  in_dst "$RSYNC" "${META[@]}" ${NOINC[@]+"${NOINC[@]}"} --dry-run --itemize-changes --out-format='%i %n' "${EXCLUDES[@]}" "$SRC/" ./ >> "$VERIFYLOG" 2>&1 &
-  heartbeat $! "Checking folders and links"
-  wait $!; rc=$?
+  launch_dst "$VERIFYLOG" - "$RSYNC" "${META[@]}" ${NOINC[@]+"${NOINC[@]}"} --dry-run --itemize-changes --out-format='%i %n' "${EXCLUDES[@]}" "$SRC/" ./
+  heartbeat "$LAUNCHED" "Checking folders and links"
+  wait "$LAUNCHED"; rc=$?
   case $rc in 0|24) ;; 23) [ "$vrc" -eq 0 ] && vrc=23 ;; 20) RESULT="⏸ Stopped during verification — run the same command again to redo it."; exit 20 ;; *) [ "$vrc" -eq 0 ] && vrc=$rc ;; esac
   words "$(diff_summary "$VERIFYLOG" "$RUNDIR/repair")" DIFFS META_DIFFS
   rm -f "$VSTATE"                       # the check is complete: a later check starts afresh
@@ -2080,7 +2124,7 @@ if [ "$VERIFY_ONLY" -eq 1 ]; then
   step "List the files" "Making a list of every file on both drives, so the check knows exactly how much there is." "check every file's contents"
   plan_scan; post_scan_checks
 elif [ "$ENGINE" = stream ]; then
-  step "List and copy the files" "Listing the source and copying at the same time: copying starts as soon as the first files are found, and totals keep growing until the listing is done.$([ "$VERIFY" != 0 ] && echo " Copied files are checked as they finish, by reading them back from the destination.")" "a final pass for folders and links"
+  step "List and copy the files" "Listing the source and copying at the same time: copying starts as soon as the first files are found, and totals keep growing until the listing is done.$([ "$VERIFY" != 0 ] && [ "$STREAM_CHECKERS" -gt 0 ] && echo " Copied files are checked as they finish, by reading them back from the destination.")" "a final pass for folders and links"
   stream_copy
   if [ "$STREAM_OK" -eq 1 ]; then
     done_msg "Found $ALL_FILES files ($(hk $(( ${ALL_BYTES%%.*} / 1024 )))) on the source; copied $COPIED_FILES.$([ "$STREAM_CHECKED" -gt 0 ] && echo " $STREAM_CHECKED already checked.")"

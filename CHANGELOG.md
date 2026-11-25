@@ -1,5 +1,13 @@
 # Changelog
 
+## v13.1: No busy retries; gentler defaults
+- **Fix (beachball risk):** when rsync couldn't reach the destination folder from inside the drive while the drive still looked mounted, the final pass retried at once, forever, printing an error each time. The check's retry loops had the same pattern, and v12.3 had it too. All retries now go through one helper that waits for the drives, puts the run's working folder back if it's gone, and paces retries (5 s, 10 s … 30 s). After 20 tries in a row it stops with a plain explanation. A new test (`nospin`) puts a folder on the system disk in the drive's place mid-copy: v13.1 waits quietly and writes nothing there; v13.0 retried and printed errors nonstop.
+- Errors from rsync processes that can't open their output files (because the drive went away) no longer reach the screen.
+- If the device number of `/Volumes` can't be read, the destination check falls back to the mount check instead of refusing every time (which caused the endless retries above).
+- macOS's own tools come first in the PATH, so GNU versions installed with Homebrew can't change how `stat`, `date`, `sort` and the rest behave.
+- **Engine `auto` (the default):** the streaming engine for SSD sources; the batch engine (list, then copy) for hard drives and unknown drive types. The engine in use and the reason are shown at the start.
+- On exFAT and FAT32 destinations, copied files are checked in the final check instead of being read back while copying, which would compete with writing on macOS's slow driver.
+
 ## v13.0: Streaming engine — listing, copying and checking at the same time
 See [docs/STREAMING.md](docs/STREAMING.md) for the design and [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for measurements.
 - **One pipeline instead of separate stages.** A single listing of the source streams into a router that cuts batches as files are found. A pool of copiers takes batches as soon as they appear, and a checker reads copied files back from the destination while later batches are still copying. Copying starts within moments (the first batches are small), instead of after both drives have been listed in full.

@@ -1,4 +1,4 @@
-.TH SMARTCOPY 1 "2026-11-24" "smartcopy v13.0" "User Commands"
+.TH SMARTCOPY 1 "2026-11-24" "smartcopy v13.1" "User Commands"
 .SH NAME
 smartcopy \- resumable, self-checking copy of a drive or folder on macOS, with a plain-English report
 .SH SYNOPSIS
@@ -119,9 +119,15 @@ afterwards) and explain what limits the speed and whether
 .B \-\-jobs
 helps.
 .TP
-.BI \-\-engine " stream|batch"
+.BI \-\-engine " auto|stream|batch"
+.B auto
+(the default) uses
 .B stream
-(the default) lists, copies and checks at the same time.
+when the source is an SSD and
+.B batch
+otherwise.
+.B stream
+lists, copies and checks at the same time.
 .B batch
 lists both drives completely first, then copies (the engine of v12.3). The streaming engine switches
 to the batch engine by itself if its listing is cut off. Also set by the

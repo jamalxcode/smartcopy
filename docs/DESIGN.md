@@ -107,6 +107,7 @@ Each of these was found on a real Mac and wasn't reproducible in the original te
 | A stopped copy lost its fingerprints (v12.3) | Fingerprints were saved only after the final pass | Save them as each batch finishes |
 | "Folder in the way" errors missing from the report (v12.3) | rsync's "could not make way" message has no `rsync:` prefix | Recognise it and explain it |
 | Possible hang in the check (v12.3) | Incremental listing with `-H` hangs when an item can't be replaced | `--no-inc-recursive` whenever `-H` is used |
+| Endless retries, risking a beachball (v13.1) | A refused destination (drive "mounted" but unreachable) was retried at once, forever | Paced retries through one helper, with a limit and a plain explanation |
 | Dry run exit code (v12.3) | The pipeline reported awk's status, not rsync's | Take rsync's status from the pipeline |
 
 ## Ideas considered and not done

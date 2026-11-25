@@ -38,7 +38,7 @@ Ways to make it fit your day:
 - `--no-verify` now, `--verify-only` later (overnight, for example). Both can be stopped and resumed.
 - After the first full check, re-checks read only the destination, which is usually much faster.
 - Biggest speed-up: if the destination is only used with Macs, format it as **APFS** instead of exFAT. Erasing deletes everything on it.
-- Copying from a **spinning hard drive** and only the total time matters? Try `--engine batch`. The default engine lists and copies at the same time, which starts copying sooner but makes a hard drive's head jump between the two.
+- Copying from a **spinning hard drive**? smartcopy then lists everything first and copies after (`--engine batch`) automatically, because listing and copying at the same time would make the drive's head jump between the two. From an SSD it does both at once.
 
 **How much faster is v13?** It depends on what limits the copy.
 - Big files on slow drives, like the 1 TB runs above: the drives set the pace, so expect only about 3–10% less time.
@@ -167,7 +167,7 @@ To resume after any interruption, run the same command again.
 | `--verify-only` | Only check an earlier copy; resumes if stopped |
 | `--stop DEST` | Stop a running copy cleanly |
 | `--jobs N` | Copy or check N files at once (default: tuned automatically) |
-| `--engine batch` | List everything first, then copy (the v12.3 engine). Default: `stream`, which lists and copies at the same time |
+| `--engine X` | `stream`: list and copy at the same time; `batch`: list everything first, then copy (the v12.3 engine). Default `auto`: stream for SSD sources, batch for hard drives |
 | `--speed-test` | Measure both drives and explain what limits speed |
 | `--force` | Override the swapped-drives, Time Machine and startup-disk checks |
 | `MAX_STUCK=N` | Give up after N passes in a row with no progress (default 6) |

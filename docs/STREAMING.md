@@ -78,6 +78,7 @@ Nothing changes: the pipes between stages are anonymous pipes in memory, and eve
 
 ## Choosing the engine
 
-- `--engine stream` (default for copies), or `--engine batch` for v12.3's list-then-copy engine. You can also set `SMARTCOPY_ENGINE`.
+- `--engine auto` (the default) uses the streaming engine when the source is an SSD, and the batch engine for hard drives and unknown drive types. `--engine stream` and `--engine batch` force one or the other; you can also set `SMARTCOPY_ENGINE`. The engine in use and the reason are shown at the start.
+- On exFAT and FAT32 destinations, files aren't read back while copying. macOS's driver for these formats is slow, and reading back would compete with writing. They're all checked in the final check instead.
 - `--verify-only` and `--dry-run` use the batch engine's listing (they don't copy).
-- On a spinning hard drive, listing and copying at the same time make the drive's head move between the two. Copying starts much sooner, but the total time can be a little longer than with `--engine batch`. If the total time matters more than getting started, use `--engine batch` for hard-drive sources.
+- On a spinning hard drive, listing and copying at the same time would make the drive's head move between the two, so `auto` picks the batch engine for hard-drive sources. `--engine stream` still starts copying sooner there, but the total time can be longer.
